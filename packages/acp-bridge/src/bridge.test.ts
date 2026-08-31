@@ -29036,6 +29036,32 @@ describe('createAcpSessionBridge', () => {
       await bridge.shutdown();
     });
 
+    it('migrates legacy scheduled-task titles to automatic provenance', async () => {
+      const bridge = makeBridge({
+        channelFactory: async () => makeChannel().channel,
+      });
+      const session = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        sessionScope: 'thread',
+        sourceType: 'scheduled_task',
+      });
+
+      bridge.updateSessionMetadata(session.sessionId, {
+        displayName: '⏰ old prompt',
+        titleSource: 'manual',
+      });
+      const effective = bridge.updateSessionMetadata(session.sessionId, {
+        displayName: 'new prompt',
+        titleSource: 'auto',
+      });
+
+      expect(effective).toMatchObject({
+        displayName: 'new prompt',
+        titleSource: 'auto',
+      });
+      await bridge.shutdown();
+    });
+
     it('still auto-names a never-titled session and re-names an auto session (#8977)', async () => {
       // The broader manual→auto guard must not break legitimate machine
       // naming: a session with no title yet accepts the derived ⏰ name +
@@ -29194,6 +29220,21 @@ describe('createAcpSessionBridge', () => {
       ).toThrow(InvalidSessionMetadataError);
 
       await bridge.closeSession(session.sessionId);
+      await bridge.shutdown();
+    });
+
+    it('rejects display names the child cannot persist', async () => {
+      const bridge = makeBridge({
+        channelFactory: async () => makeChannel().channel,
+      });
+      const session = await bridge.spawnOrAttach({ workspaceCwd: WS_A });
+
+      expect(() =>
+        bridge.updateSessionMetadata(session.sessionId, {
+          displayName: 'x'.repeat(201),
+        }),
+      ).toThrow(InvalidSessionMetadataError);
+
       await bridge.shutdown();
     });
 

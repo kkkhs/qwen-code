@@ -325,7 +325,7 @@ describe('serve-bridge', () => {
     });
 
     describe('session_update_metadata', () => {
-      it('stamps an explicit name manual and an absent name auto', async () => {
+      it('stamps an explicit name manual and an empty name auto', async () => {
         const { state, calls } = makeMockState({
           defaultSessionId: 'session-1',
           fetchReply: () =>
@@ -346,8 +346,8 @@ describe('serve-bridge', () => {
         // An explicitly provided name is user-chosen and must survive the
         // web-shell /clear carry-over gate (titleSource === 'manual').
         await metadataTool.handler({ display_name: 'Agent rename' }, {});
-        // An absent name is machine handling.
-        await metadataTool.handler({}, {});
+        // An empty name is machine handling and clears the title.
+        await metadataTool.handler({ display_name: '' }, {});
 
         const patches = calls.filter(
           (call) =>
@@ -360,6 +360,7 @@ describe('serve-bridge', () => {
           titleSource: 'manual',
         });
         expect(JSON.parse(patches[1]!.body!)).toEqual({
+          displayName: '',
           titleSource: 'auto',
         });
       });

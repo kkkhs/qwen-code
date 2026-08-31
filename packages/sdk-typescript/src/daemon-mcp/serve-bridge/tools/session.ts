@@ -136,16 +136,13 @@ export function sessionTools(state: BridgeState): any[] {
           .string()
           .optional()
           .describe('Session ID. Uses default session if omitted.'),
-        display_name: z
-          .string()
-          .optional()
-          .describe('New display name for the session.'),
+        display_name: z.string().describe('New display name for the session.'),
       },
       handler(async (args) => {
         const sessionId = resolveSessionId(state, args.session_id);
-        // Mirror the ACP branch convention: an explicitly provided name is
-        // user-chosen ('manual' — survives the web-shell /clear carry-over),
-        // while a cleared/absent name is machine handling ('auto').
+        // Mirror the ACP branch convention: a non-empty name is user-chosen
+        // ('manual' — survives the web-shell /clear carry-over), while an empty
+        // name clears it with machine provenance ('auto').
         const result = await state.client.updateSessionMetadata(sessionId, {
           displayName: args.display_name,
           titleSource: args.display_name?.trim() ? 'manual' : 'auto',
