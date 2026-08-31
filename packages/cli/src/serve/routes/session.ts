@@ -13,6 +13,10 @@ import {
   GROUP_COLOR_OPTIONS,
   GitWorktreeService,
   SessionOrganizationError,
+  SessionIdCaseConflictError,
+  SessionStorageEntryError,
+  SessionTranscriptChangedError,
+  SessionTranscriptIdentityUnavailableError,
   SESSION_TRANSCRIPT_MAX_LIMIT,
   SESSION_TRANSCRIPT_MAX_EXPANDED_PAGE_BYTES,
   SESSION_TRANSCRIPT_MAX_PAGE_BYTES,
@@ -40,14 +44,20 @@ import {
   DAEMON_PROMPT_DISPLAY_TEXT_META_KEY,
   type BridgeBranchedSession,
 } from '@qwen-code/acp-bridge/bridgeTypes';
+import type { BridgeEvent } from '@qwen-code/acp-bridge/eventBus';
 import { parseSessionSource } from '@qwen-code/acp-bridge';
 import {
   isReservedLiveSessionSource,
   isReservedStandaloneSessionSource,
+  readLoadableConversationSession,
   readLoadableLiveConversationMetadata,
 } from '../../runtime/live-session-source.js';
 import type { ConversationRuntimeActivityGate } from '../conversations/conversation-runtime-activity.js';
 import { ConversationRuntimeOwnershipError } from '../conversations/conversation-runtime-errors.js';
+import {
+  StandaloneSessionServiceError,
+  type StandaloneSessionService,
+} from '../conversations/standalone-session-service.js';
 import express, {
   type Application,
   type ErrorRequestHandler,
@@ -155,6 +165,11 @@ import {
   sendUntrustedWorkspaceResponse,
   sendWorkspaceRuntimeUnavailable,
 } from '../workspace-route-runtime.js';
+import {
+  redactWorkflowsFromAvailableCommandsEvent,
+  redactWorkflowsFromReplayArrays,
+  redactWorkflowsFromSupportedCommands,
+} from '../workflow-session-gate.js';
 import type {
   WorkspaceEntry,
   WorkspaceRegistry,
@@ -183,6 +198,26 @@ import {
 // `..`, `.lock` suffixes, etc.). Compared case-insensitively because ref
 // storage is case-folding on macOS/Windows.
 const GIT_RESERVED_BRANCH = 'HEAD';
+
+function redactSdkSurfaceEvent<T extends { type: string; data: unknown }>(
+  event: T,
+  workspaceTrusted: boolean,
+): T {
+  const shaped = omitSkillDetailsForSdkSurface(event);
+  return workspaceTrusted
+    ? shaped
+    : redactWorkflowsFromAvailableCommandsEvent(shaped);
+}
+
+function redactSdkSurfaceReplay<
+  T extends {
+    compactedReplay?: BridgeEvent[];
+    liveJournal?: BridgeEvent[];
+  },
+>(session: T, workspaceTrusted: boolean): T {
+  const shaped = omitSkillDetailsFromReplayArrays(session);
+  return workspaceTrusted ? shaped : redactWorkflowsFromReplayArrays(shaped);
+}
 
 // Byte-length caps for branch names. git creates loose refs as files under
 // `.git/refs/heads/`, so each `/`-separated component is bounded by the
@@ -214,6 +249,10 @@ interface RegisterSessionRoutesDeps {
   ensureConversationRuntime?: () => Promise<WorkspaceRuntime>;
   liveConversationRootPath?: string;
   conversationRuntimeActivity?: ConversationRuntimeActivityGate;
+  standaloneSessionService?: Pick<
+    StandaloneSessionService,
+    'restoreLegacyForCompatibility' | 'dispatchPrompt' | 'continueSession'
+  >;
 }
 
 // Chosen cap for one serialized transcript response, kept proportional to
@@ -581,6 +620,42 @@ function parseOptionalApprovalMode(
     return null;
   }
   return rawApprovalMode as ApprovalMode;
+}
+
+function parseRequestedSessionSource(
+  body: Record<string, unknown>,
+  res: Response,
+): { sourceType?: string; sourceId?: string } | null {
+  if (
+    isReservedStandaloneSessionSource({
+      sourceType:
+        typeof body['sourceType'] === 'string' ? body['sourceType'] : undefined,
+    })
+  ) {
+    res.status(400).json({
+      error:
+        'The requested session source is reserved for daemon-owned standalone sessions.',
+      code: 'reserved_session_source',
+    });
+    return null;
+  }
+  const source = parseSessionSource(body['sourceType'], body['sourceId']);
+  if ('error' in source) {
+    res.status(400).json({
+      error: source.error,
+      code: 'invalid_session_source',
+    });
+    return null;
+  }
+  if (isReservedLiveSessionSource(source)) {
+    res.status(400).json({
+      error:
+        'The requested session source is reserved for daemon-owned Live Voice sessions.',
+      code: 'reserved_session_source',
+    });
+    return null;
+  }
+  return source;
 }
 
 export function registerSessionRoutes(
@@ -1145,12 +1220,42 @@ export function registerSessionRoutes(
     return true;
   };
 
+  const hasLifecycleStorageEvidence = async (
+    service: ReturnType<typeof createWorkspaceRuntimeSessionService>,
+    sessionId: string,
+  ): Promise<boolean> => {
+    try {
+      return (
+        (await service.getMaintainableSessionLocation(sessionId)) !== undefined
+      );
+    } catch (error) {
+      if (error instanceof SessionStorageEntryError) {
+        return error.reason !== 'foreign_project';
+      }
+      if (error instanceof SessionTranscriptIdentityUnavailableError) {
+        return true;
+      }
+      if (error instanceof SessionTranscriptChangedError) {
+        return true;
+      }
+      if (
+        error !== null &&
+        typeof error === 'object' &&
+        typeof (error as NodeJS.ErrnoException).code === 'string'
+      ) {
+        return true;
+      }
+      throw error;
+    }
+  };
+
   const resolveQualifiedSessionRuntime = async (
     req: Request,
     res: Response,
     route: string,
     sessionIds: readonly string[],
     archiveState: SessionArchiveState | 'any',
+    options: { lifecycleMaintenance?: boolean } = {},
   ): Promise<WorkspaceRuntime | undefined> => {
     const target = resolveQualifiedSessionTarget(req, res);
     if (!target) return undefined;
@@ -1165,6 +1270,12 @@ export function registerSessionRoutes(
     const runtime = generation.runtime;
     const service = createWorkspaceRuntimeSessionService(runtime);
     for (const sessionId of sessionIds) {
+      if (options.lifecycleMaintenance) {
+        if (!(await hasLifecycleStorageEvidence(service, sessionId))) {
+          throw new SessionNotFoundError(sessionId);
+        }
+        continue;
+      }
       const location = await service.getSessionLocation(sessionId);
       if (location === 'conflict') {
         if (archiveState !== 'active') {
@@ -1598,6 +1709,47 @@ export function registerSessionRoutes(
     });
   };
 
+  const isStandaloneOwner = (
+    runtime: WorkspaceRuntime,
+    sessionId: string,
+  ): boolean =>
+    isInternalWorkspaceRuntime(runtime) &&
+    isReservedStandaloneSessionSource(
+      runtime.bridge.getSessionSummary(sessionId),
+    );
+
+  const resolveOwnerSessionRuntime = async (
+    sessionId: string,
+    res: Response,
+    route: string,
+  ): Promise<
+    { runtime: WorkspaceRuntime; standalone: boolean } | undefined
+  > => {
+    const runtime = resolveLiveSessionRuntime(sessionId, res, route);
+    if (!runtime) return undefined;
+    if (!isInternalWorkspaceRuntime(runtime)) {
+      return { runtime, standalone: false };
+    }
+    if (!deps.conversationRuntimeActivity) {
+      throw new Error('Conversations runtime activity gate is unavailable.');
+    }
+    const standalone = await deps.conversationRuntimeActivity.run(async () =>
+      isStandaloneOwner(runtime, sessionId),
+    );
+    return { runtime, standalone };
+  };
+
+  const runOwnerRuntimeActivity = <T>(
+    runtime: WorkspaceRuntime,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    if (!isInternalWorkspaceRuntime(runtime)) return operation();
+    if (!deps.conversationRuntimeActivity) {
+      throw new Error('Conversations runtime activity gate is unavailable.');
+    }
+    return deps.conversationRuntimeActivity.run(operation);
+  };
+
   const withOwnerMutableSession =
     (
       route: string,
@@ -1606,20 +1758,66 @@ export function registerSessionRoutes(
         res: Response,
         sessionId: string,
         runtime: WorkspaceRuntime,
+        onPromptAdmitted?: () => void,
       ) => Promise<void> | void,
+      options: {
+        cwdBound?: 'always' | 'rewind-files' | 'sync-output-language';
+        promptAdmission?: boolean;
+      } = {},
     ): RequestHandler =>
     async (req, res) => {
       const sessionId = requireSessionId(req, res);
       if (sessionId === null) return;
       try {
-        const runtime = resolveLiveSessionRuntime(sessionId, res, route);
-        if (!runtime) return;
-        await archiveCoordinator.runSharedMany([sessionId], async () => {
-          runtime.generationGuard?.assertOpen();
-          await handler(req, res, sessionId, runtime);
-        });
+        const owner = await resolveOwnerSessionRuntime(sessionId, res, route);
+        if (!owner) return;
+        const { runtime, standalone } = owner;
+        const cwdBound =
+          options.cwdBound === 'always' ||
+          (options.cwdBound === 'rewind-files' &&
+            safeBody(req)['rewindFiles'] !== false) ||
+          (options.cwdBound === 'sync-output-language' &&
+            safeBody(req)['syncOutputLanguage'] === true);
+        if (standalone && (options.promptAdmission || cwdBound)) {
+          const service = deps.standaloneSessionService;
+          if (!service) {
+            throw new Error('Standalone session service is unavailable.');
+          }
+          if (options.promptAdmission) {
+            await service.dispatchPrompt(
+              sessionId,
+              (ownerRuntime, canonicalSessionId, onPromptAdmitted) =>
+                Promise.resolve(
+                  handler(
+                    req,
+                    res,
+                    canonicalSessionId,
+                    ownerRuntime,
+                    onPromptAdmitted,
+                  ),
+                ),
+            );
+          } else {
+            await service.continueSession(
+              sessionId,
+              (ownerRuntime, canonicalSessionId) =>
+                Promise.resolve(
+                  handler(req, res, canonicalSessionId, ownerRuntime),
+                ),
+            );
+          }
+          return;
+        }
+        await runOwnerRuntimeActivity(runtime, () =>
+          archiveCoordinator.runSharedMany([sessionId], async () => {
+            runtime.generationGuard?.assertOpen();
+            await handler(req, res, sessionId, runtime);
+          }),
+        );
       } catch (err) {
-        sendBridgeError(res, err, { route, sessionId });
+        if (!res.headersSent) {
+          sendBridgeError(res, err, { route, sessionId });
+        }
       }
     };
 
@@ -1632,16 +1830,36 @@ export function registerSessionRoutes(
         sessionId: string,
         runtime: WorkspaceRuntime,
       ) => Promise<void> | void,
+      options: { cwdBound?: boolean } = {},
     ): RequestHandler =>
     async (req, res) => {
       const sessionId = requireSessionId(req, res);
       if (sessionId === null) return;
       try {
-        const runtime = resolveLiveSessionRuntime(sessionId, res, route);
-        if (!runtime) return;
-        await handler(req, res, sessionId, runtime);
+        const owner = await resolveOwnerSessionRuntime(sessionId, res, route);
+        if (!owner) return;
+        const { runtime, standalone } = owner;
+        if (options.cwdBound && standalone) {
+          const service = deps.standaloneSessionService;
+          if (!service) {
+            throw new Error('Standalone session service is unavailable.');
+          }
+          await service.continueSession(
+            sessionId,
+            (ownerRuntime, canonicalSessionId) =>
+              Promise.resolve(
+                handler(req, res, canonicalSessionId, ownerRuntime),
+              ),
+          );
+          return;
+        }
+        await runOwnerRuntimeActivity(runtime, () =>
+          Promise.resolve(handler(req, res, sessionId, runtime)),
+        );
       } catch (err) {
-        sendBridgeError(res, err, { route, sessionId });
+        if (!res.headersSent) {
+          sendBridgeError(res, err, { route, sessionId });
+        }
       }
     };
 
@@ -1975,22 +2193,52 @@ export function registerSessionRoutes(
     sessionIds: readonly string[],
   ): Promise<WorkspaceRuntime | undefined> => {
     if (req) {
-      return resolveQualifiedSessionRuntime(req, res, route, sessionIds, 'any');
+      return resolveQualifiedSessionRuntime(
+        req,
+        res,
+        route,
+        sessionIds,
+        'any',
+        { lifecycleMaintenance: true },
+      );
     }
 
     let internalRuntime: WorkspaceRuntime | undefined;
     let hasInternalSession = false;
-    const hasOrdinarySession = async (sessionId: string): Promise<boolean> => {
-      for (const runtime of workspaceRegistry.list()) {
+    let hasOrdinaryLiveSession = false;
+    const findOrdinarySessions = async (
+      sessionId: string,
+    ): Promise<Set<WorkspaceRuntime> | undefined> => {
+      const runtimes = new Set<WorkspaceRuntime>();
+      for (const entry of workspaceRegistry.listAllEntries()) {
+        const generation = entry.current;
+        if (entry.internal || !generation) continue;
         if (
-          await createWorkspaceRuntimeSessionService(
-            runtime,
-          ).sessionExistsInAnyState(sessionId)
+          entry.state !== 'active' ||
+          entry.current !== generation ||
+          generation.guard.closed
         ) {
-          return true;
+          sendWorkspaceRuntimeUnavailable(res);
+          return undefined;
         }
+        generation.guard.assertOpen();
+        const exists = await hasLifecycleStorageEvidence(
+          createWorkspaceRuntimeSessionService(generation.runtime),
+          sessionId,
+        );
+        if (
+          entry.state !== 'active' ||
+          entry.current !== generation ||
+          generation.guard.closed
+        ) {
+          sendWorkspaceRuntimeUnavailable(res);
+          return undefined;
+        }
+        if (!exists) continue;
+        generation.guard.assertOpen();
+        runtimes.add(generation.runtime);
       }
-      return false;
+      return runtimes;
     };
     const sendBatchWorkspaceConflict = (): void => {
       res.status(409).json({
@@ -2000,17 +2248,28 @@ export function registerSessionRoutes(
     };
     for (const sessionId of sessionIds) {
       const candidates = new Set<WorkspaceRuntime>();
+      const ordinaryLiveCandidates = new Set<WorkspaceRuntime>();
       const owner = workspaceRegistry.resolveLiveSessionOwner(sessionId);
       if (owner.kind === 'unavailable') {
         sendWorkspaceRuntimeUnavailable(res);
         return undefined;
       }
-      if (owner.kind === 'found' && isInternalWorkspaceRuntime(owner.runtime)) {
-        candidates.add(owner.runtime);
+      if (owner.kind === 'found') {
+        if (isInternalWorkspaceRuntime(owner.runtime)) {
+          candidates.add(owner.runtime);
+        } else {
+          ordinaryLiveCandidates.add(owner.runtime);
+          hasOrdinaryLiveSession = true;
+        }
       }
       if (owner.kind === 'ambiguous') {
         for (const runtime of owner.runtimes) {
-          if (isInternalWorkspaceRuntime(runtime)) candidates.add(runtime);
+          if (isInternalWorkspaceRuntime(runtime)) {
+            candidates.add(runtime);
+          } else {
+            ordinaryLiveCandidates.add(runtime);
+            hasOrdinaryLiveSession = true;
+          }
         }
       }
       for (const entry of workspaceRegistry.listAllEntries()) {
@@ -2021,32 +2280,32 @@ export function registerSessionRoutes(
         }
         const runtime = generation.runtime;
         const service = createWorkspaceRuntimeSessionService(runtime);
-        const exists = await service.sessionExistsInAnyState(sessionId);
+        const exists = await hasLifecycleStorageEvidence(service, sessionId);
         if (!assertCurrentInternalGeneration(entry, generation, res)) {
           return undefined;
         }
         if (!exists) continue;
-        const metadata = await readLoadableLiveConversationMetadata(
-          sessionId,
-          service,
-        );
-        if (!assertCurrentInternalGeneration(entry, generation, res)) {
-          return undefined;
-        }
-        if (!metadata) continue;
         candidates.add(runtime);
       }
-      if (candidates.size > 0) {
-        for (const runtime of workspaceRegistry.list()) {
-          const service = createWorkspaceRuntimeSessionService(runtime);
-          if (await service.sessionExistsInAnyState(sessionId)) {
-            candidates.add(runtime);
-          }
+      if (candidates.size > 0 || hasInternalSession) {
+        if (hasOrdinaryLiveSession && ordinaryLiveCandidates.size === 0) {
+          sendBatchWorkspaceConflict();
+          return undefined;
+        }
+        for (const runtime of ordinaryLiveCandidates) {
+          candidates.add(runtime);
+        }
+        const ordinarySessions = await findOrdinarySessions(sessionId);
+        if (!ordinarySessions) return undefined;
+        for (const runtime of ordinarySessions) {
+          candidates.add(runtime);
         }
       }
       if (candidates.size === 0) {
         if (hasInternalSession) {
-          if (await hasOrdinarySession(sessionId)) {
+          const ordinarySessions = await findOrdinarySessions(sessionId);
+          if (!ordinarySessions) return undefined;
+          if (ordinarySessions.size > 0) {
             sendBatchWorkspaceConflict();
             return undefined;
           }
@@ -2074,18 +2333,13 @@ export function registerSessionRoutes(
 
     for (const sessionId of sessionIds) {
       const service = createWorkspaceRuntimeSessionService(internalRuntime);
-      if (!(await service.sessionExistsInAnyState(sessionId))) {
-        if (await hasOrdinarySession(sessionId)) {
+      if (!(await hasLifecycleStorageEvidence(service, sessionId))) {
+        const ordinarySessions = await findOrdinarySessions(sessionId);
+        if (!ordinarySessions) return undefined;
+        if (ordinarySessions.size > 0) {
           sendBatchWorkspaceConflict();
           return undefined;
         }
-        throw new SessionNotFoundError(sessionId);
-      }
-      const metadata = await readLoadableLiveConversationMetadata(
-        sessionId,
-        service,
-      );
-      if (!metadata) {
         throw new SessionNotFoundError(sessionId);
       }
     }
@@ -2137,6 +2391,20 @@ export function registerSessionRoutes(
     return [...new Set(sessionIds as string[])];
   };
 
+  const parseResolveConflicts = (
+    req: Request,
+    res: Response,
+  ): boolean | undefined => {
+    const value: unknown = safeBody(req)['resolveConflicts'];
+    if (value === undefined) return false;
+    if (typeof value === 'boolean') return value;
+    res.status(400).json({
+      error: '`resolveConflicts` must be a boolean',
+      code: 'invalid_request',
+    });
+    return undefined;
+  };
+
   // Mirrors the bridge's displayName control-character rule (ESLint forbids
   // control-char regexes).
   const hasControlCharacter = (value: string): boolean =>
@@ -2150,12 +2418,16 @@ export function registerSessionRoutes(
   const parseSessionPrBody = (
     req: Request,
     res: Response,
-  ): { number: number; url: string } | null | undefined => {
+  ):
+    | { number: number; url: string; state?: 'open' | 'merged' | 'closed' }
+    | null
+    | undefined => {
     const raw: unknown = safeBody(req)['pr'];
     if (raw === undefined) return undefined;
     const candidate = raw as Record<string, unknown> | null;
     const number = candidate?.['number'];
     const url = candidate?.['url'];
+    const state = candidate?.['state'];
     if (
       candidate === null ||
       typeof candidate !== 'object' ||
@@ -2167,16 +2439,20 @@ export function registerSessionRoutes(
       !/^https?:\/\//i.test(url) ||
       // The url lands in the bridge's stderr audit line — control
       // characters would let a caller forge log lines.
-      hasControlCharacter(url)
+      hasControlCharacter(url) ||
+      (state !== undefined &&
+        state !== 'open' &&
+        state !== 'merged' &&
+        state !== 'closed')
     ) {
       res.status(400).json({
-        error: `\`pr\` must be an object with a positive integer \`number\` and an http(s) \`url\` of at most ${SESSION_PR_URL_MAX_LENGTH} characters, without control characters`,
+        error: `\`pr\` must be an object with a positive integer \`number\` and an http(s) \`url\` of at most ${SESSION_PR_URL_MAX_LENGTH} characters, without control characters, and an optional \`state\` of \`open\`, \`merged\`, or \`closed\``,
         code: 'invalid_metadata',
         field: 'pr',
       });
       return null;
     }
-    return { number, url };
+    return { number, url, ...(state ? { state } : {}) };
   };
 
   const serializeSessionErrors = (
@@ -2185,11 +2461,12 @@ export function registerSessionRoutes(
   ): Array<{ sessionId: string; error: string }> =>
     errors.map((e) => ({
       sessionId: e.sessionId,
-      error: redactDetails
-        ? 'Session operation failed.'
-        : e.error instanceof Error
-          ? e.error.message
-          : String(e.error),
+      error:
+        redactDetails && !(e.error instanceof SessionConflictError)
+          ? 'Session operation failed.'
+          : e.error instanceof Error
+            ? e.error.message
+            : String(e.error),
     }));
 
   const runResolvedSessionBatch = async <T>(params: {
@@ -2225,7 +2502,10 @@ export function registerSessionRoutes(
         sendWorkspaceRuntimeUnavailable(res);
         return undefined;
       }
-      return { result: await run(verifiedRuntime, true), internal: true };
+      return {
+        result: await run(verifiedRuntime, true),
+        internal: isInternalWorkspaceRuntime(verifiedRuntime),
+      };
     });
   };
 
@@ -2239,9 +2519,10 @@ export function registerSessionRoutes(
       runtime: WorkspaceRuntime,
       coordinatorLockHeld: boolean,
     ) => {
-      captureRuntimeGenerationAssertion(runtime)?.();
+      const assertCanMutate = captureRuntimeGenerationAssertion(runtime);
+      assertCanMutate?.();
       const service = createWorkspaceRuntimeSessionService(runtime);
-      return runWithSessionListInvalidation(
+      const result = await runWithSessionListInvalidation(
         runtime,
         ['active', 'archived'],
         () =>
@@ -2252,6 +2533,7 @@ export function registerSessionRoutes(
               bridge: runtime.bridge,
               coordinator: archiveCoordinator,
               coordinatorLockHeld,
+              assertCanMutate,
               onError: ({ phase, sessionId, error }) => {
                 writeStderrLine(
                   `qwen serve: ${phase}Session failed for ${safeLogValue(sessionId)}: ${safeLogValue(error)}`,
@@ -2260,6 +2542,8 @@ export function registerSessionRoutes(
             }),
           ),
       );
+      assertCanMutate?.();
+      return result;
     };
     return runResolvedSessionBatch({ req, res, route, sessionIds, run });
   };
@@ -2269,16 +2553,18 @@ export function registerSessionRoutes(
     res: Response,
     route: string,
     sessionIds: string[],
+    resolveConflicts = false,
   ) => {
     const run = async (
       runtime: WorkspaceRuntime,
       coordinatorLockHeld: boolean,
     ) => {
-      captureRuntimeGenerationAssertion(runtime)?.();
+      const assertCanMutate = captureRuntimeGenerationAssertion(runtime);
+      assertCanMutate?.();
       const service = createWorkspaceRuntimeSessionService(runtime, {
         onWarning: logSessionArchiveWarning,
       });
-      return runWithSessionListInvalidation(
+      const result = await runWithSessionListInvalidation(
         runtime,
         ['active', 'archived'],
         () =>
@@ -2289,9 +2575,13 @@ export function registerSessionRoutes(
               bridge: runtime.bridge,
               coordinator: archiveCoordinator,
               coordinatorLockHeld,
+              resolveConflicts,
+              assertCanMutate,
             }),
           ),
       );
+      assertCanMutate?.();
+      return result;
     };
     return runResolvedSessionBatch({ req, res, route, sessionIds, run });
   };
@@ -2301,16 +2591,18 @@ export function registerSessionRoutes(
     res: Response,
     route: string,
     sessionIds: string[],
+    resolveConflicts = false,
   ) => {
     const run = async (
       runtime: WorkspaceRuntime,
       coordinatorLockHeld: boolean,
     ) => {
-      captureRuntimeGenerationAssertion(runtime)?.();
+      const assertCanMutate = captureRuntimeGenerationAssertion(runtime);
+      assertCanMutate?.();
       const service = createWorkspaceRuntimeSessionService(runtime, {
         onWarning: logSessionArchiveWarning,
       });
-      return runWithSessionListInvalidation(
+      const result = await runWithSessionListInvalidation(
         runtime,
         ['active', 'archived'],
         () =>
@@ -2320,9 +2612,13 @@ export function registerSessionRoutes(
               service,
               coordinator: archiveCoordinator,
               coordinatorLockHeld,
+              resolveConflicts,
+              assertCanMutate,
             }),
           ),
       );
+      assertCanMutate?.();
+      return result;
     };
     return runResolvedSessionBatch({ req, res, route, sessionIds, run });
   };
@@ -2335,6 +2631,7 @@ export function registerSessionRoutes(
       sessionId: string,
       runtime: WorkspaceRuntime,
     ) => Promise<void> | void,
+    options: { cwdBound?: boolean; rejectStandalone?: boolean } = {},
   ): RequestHandler => {
     const primaryOnly = isPrimaryOnlyLiveSessionRoute(route);
     if (!primaryOnly && !isPrimaryOrInternalLiveSessionRoute(route)) {
@@ -2343,31 +2640,59 @@ export function registerSessionRoutes(
     return async (req, res) => {
       const sessionId = requireSessionId(req, res);
       if (sessionId === null) return;
-      const runtime = resolveLiveSessionRuntime(sessionId, res, route);
-      if (!runtime) return;
-      if (
-        !runtime.primary &&
-        (primaryOnly || !isInternalWorkspaceRuntime(runtime))
-      ) {
-        logSessionRoutingFailure(
-          route,
-          'non_primary_session_route_not_supported',
-          {
-            sessionId,
-            workspaceId: runtime.workspaceId,
-            workspaceCwd: runtime.workspaceCwd,
-          },
-        );
-        sendNonPrimarySessionRouteUnsupported(res, route, sessionId, runtime);
-        return;
-      }
       try {
-        await archiveCoordinator.runSharedMany([sessionId], async () => {
-          runtime.generationGuard?.assertOpen();
-          await handler(req, res, sessionId, runtime);
-        });
+        const owner = await resolveOwnerSessionRuntime(sessionId, res, route);
+        if (!owner) return;
+        const { runtime, standalone } = owner;
+        if (options.rejectStandalone && standalone) {
+          res.status(400).json({
+            error: 'This action is not supported in a standalone session.',
+            code: 'unsupported_action',
+            sessionId,
+            route,
+          });
+          return;
+        }
+        if (
+          !runtime.primary &&
+          (primaryOnly || !isInternalWorkspaceRuntime(runtime))
+        ) {
+          logSessionRoutingFailure(
+            route,
+            'non_primary_session_route_not_supported',
+            {
+              sessionId,
+              workspaceId: runtime.workspaceId,
+              workspaceCwd: runtime.workspaceCwd,
+            },
+          );
+          sendNonPrimarySessionRouteUnsupported(res, route, sessionId, runtime);
+          return;
+        }
+        if (options.cwdBound && standalone) {
+          const service = deps.standaloneSessionService;
+          if (!service) {
+            throw new Error('Standalone session service is unavailable.');
+          }
+          await service.continueSession(
+            sessionId,
+            (ownerRuntime, canonicalSessionId) =>
+              Promise.resolve(
+                handler(req, res, canonicalSessionId, ownerRuntime),
+              ),
+          );
+          return;
+        }
+        await runOwnerRuntimeActivity(runtime, () =>
+          archiveCoordinator.runSharedMany([sessionId], async () => {
+            runtime.generationGuard?.assertOpen();
+            await handler(req, res, sessionId, runtime);
+          }),
+        );
       } catch (err) {
-        sendBridgeError(res, err, { route, sessionId });
+        if (!res.headersSent) {
+          sendBridgeError(res, err, { route, sessionId });
+        }
       }
     };
   };
@@ -2407,37 +2732,8 @@ export function registerSessionRoutes(
     }
     const approvalMode = parseOptionalApprovalMode(body, res);
     if (approvalMode === null) return;
-    if (
-      isReservedStandaloneSessionSource({
-        sourceType:
-          typeof body['sourceType'] === 'string'
-            ? body['sourceType']
-            : undefined,
-      })
-    ) {
-      res.status(400).json({
-        error:
-          'The requested session source is reserved for daemon-owned standalone sessions.',
-        code: 'reserved_session_source',
-      });
-      return;
-    }
-    const source = parseSessionSource(body['sourceType'], body['sourceId']);
-    if ('error' in source) {
-      res.status(400).json({
-        error: source.error,
-        code: 'invalid_session_source',
-      });
-      return;
-    }
-    if (isReservedLiveSessionSource(source)) {
-      res.status(400).json({
-        error:
-          'The requested session source is reserved for daemon-owned Live Voice sessions.',
-        code: 'reserved_session_source',
-      });
-      return;
-    }
+    const source = parseRequestedSessionSource(body, res);
+    if (source === null) return;
     const clientId = parseClientIdHeader(req, res);
     if (clientId === null) return;
 
@@ -3122,10 +3418,8 @@ export function registerSessionRoutes(
         const clientId = parseClientIdHeader(req, res);
         if (clientId === null) return;
         try {
-          const session = await virtualSubagentSessions.load(
-            runtime,
-            sessionId,
-            clientId,
+          const session = await runOwnerRuntimeActivity(runtime, () =>
+            virtualSubagentSessions.load(runtime, sessionId, clientId),
           );
           if (!session) {
             res.status(404).json({
@@ -3137,7 +3431,9 @@ export function registerSessionRoutes(
           }
           // Same replay-array shape as the load response; redact skill
           // bodies for the browser surface (#9234).
-          res.status(200).json(omitSkillDetailsFromReplayArrays(session));
+          res
+            .status(200)
+            .json(redactSdkSurfaceReplay(session, runtime.trusted));
         } catch (err) {
           sendBridgeError(res, err, { route, sessionId });
         }
@@ -3171,8 +3467,107 @@ export function registerSessionRoutes(
       if (historyPageSize === null) return;
       const liveReplayMode = parseLiveReplayMode(body ?? {}, res);
       if (liveReplayMode === null) return;
+      const restoreSource = parseRequestedSessionSource(body, res);
+      if (restoreSource === null) return;
       const clientId = parseClientIdHeader(req, res);
       if (clientId === null) return;
+      if (
+        isInternalWorkspaceRuntime(runtime) &&
+        deps.standaloneSessionService &&
+        parseCallerSuppliedSessionId(sessionId).kind === 'valid'
+      ) {
+        try {
+          const legacyStandalone = await runWithWorkspaceRuntimeStorage(
+            runtime,
+            async () => {
+              const service = createWorkspaceRuntimeSessionService(runtime);
+              let storageSessionId: string | undefined;
+              try {
+                storageSessionId =
+                  await service.findSessionIdIgnoringCase(sessionId);
+              } catch (error) {
+                if (
+                  error instanceof SessionIdCaseConflictError &&
+                  error.candidateSessionId === sessionId
+                ) {
+                  return false;
+                }
+                throw error;
+              }
+              if (storageSessionId === undefined) return false;
+              const source = await readLoadableConversationSession(
+                storageSessionId,
+                service,
+              );
+              return (
+                source?.kind === 'standalone' && source.persistence === 'legacy'
+              );
+            },
+          );
+          if (legacyStandalone) {
+            const session =
+              await deps.standaloneSessionService.restoreLegacyForCompatibility(
+                action,
+                sessionId,
+                {
+                  ...(clientId !== undefined ? { clientId } : {}),
+                  ...(historyPageSize !== undefined ? { historyPageSize } : {}),
+                  ...(liveReplayMode !== undefined ? { liveReplayMode } : {}),
+                  ...(approvalMode !== undefined ? { approvalMode } : {}),
+                },
+              );
+            try {
+              assertRuntimeGenerationOpen?.();
+            } catch (error) {
+              if (session.attached) {
+                await runtime.bridge
+                  .detachClient(session.sessionId, session.clientId)
+                  .catch(() => {});
+              } else {
+                await runtime.bridge
+                  .killSession(session.sessionId, {
+                    requireZeroAttaches: true,
+                  })
+                  .catch(() => {});
+              }
+              throw error;
+            }
+            setDaemonTelemetryWorkspace(res, runtime.workspaceCwd);
+            daemonLog?.info(`session ${action} (legacy standalone adoption)`, {
+              sessionId: session.sessionId,
+              clientId: session.clientId,
+            });
+            if (!res.writable) {
+              if (session.attached) {
+                runtime.bridge
+                  .detachClient(session.sessionId, session.clientId)
+                  .catch(() => {});
+              } else {
+                runtime.bridge
+                  .killSession(session.sessionId, {
+                    requireZeroAttaches: true,
+                  })
+                  .catch(() => {});
+              }
+              return;
+            }
+            res
+              .status(200)
+              .json(redactSdkSurfaceReplay(session, runtime.trusted));
+            return;
+          }
+        } catch (error) {
+          if (
+            !(
+              error instanceof StandaloneSessionServiceError &&
+              error.code === 'standalone_session_not_found'
+            )
+          ) {
+            sendBridgeError(res, error, { route, sessionId });
+            return;
+          }
+        }
+      }
       let sessionIdReservation: RequestedSessionIdReservation | undefined;
       if (!isInternalWorkspaceRuntime(runtime)) {
         try {
@@ -3256,6 +3651,25 @@ export function registerSessionRoutes(
               titleInfo.title,
               titleInfo.source,
             );
+            const {
+              sourceType: _reservedSourceType,
+              sourceId: _reservedSourceId,
+              ...metadataWithoutSource
+            } = metadata;
+            const restoreMetadata =
+              !isInternalWorkspaceRuntime(runtime) &&
+              isReservedStandaloneSessionSource(metadata)
+                ? metadataWithoutSource
+                : metadata;
+            const hasPersistedSource =
+              'sourceType' in restoreMetadata &&
+              restoreMetadata.sourceType !== undefined;
+            const restoreRequestMetadata = {
+              ...restoreMetadata,
+              ...(hasPersistedSource || isInternalWorkspaceRuntime(runtime)
+                ? {}
+                : restoreSource),
+            };
             assertRuntimeGenerationOpen?.();
             if (isInternalWorkspaceRuntime(runtime)) {
               sessionIdReservation = requestedSessionIdAdmission.reserveRestore(
@@ -3293,7 +3707,7 @@ export function registerSessionRoutes(
                     ...(liveReplayMode !== undefined ? { liveReplayMode } : {}),
                     ...(clientId !== undefined ? { clientId } : {}),
                     ...(approvalMode !== undefined ? { approvalMode } : {}),
-                    ...metadata,
+                    ...restoreRequestMetadata,
                     ...persistedTitle,
                   })
                 : await runtime.bridge.resumeSession({
@@ -3301,7 +3715,7 @@ export function registerSessionRoutes(
                     workspaceCwd,
                     ...(clientId !== undefined ? { clientId } : {}),
                     ...(approvalMode !== undefined ? { approvalMode } : {}),
-                    ...metadata,
+                    ...restoreRequestMetadata,
                     ...persistedTitle,
                   });
             // Every path that can register a Live entry relocates it before a
@@ -3542,7 +3956,7 @@ export function registerSessionRoutes(
         }
         // The load response embeds the replay snapshot inline; redact the
         // skill bodies there just like the SSE egress does (#9234).
-        res.status(200).json(omitSkillDetailsFromReplayArrays(session));
+        res.status(200).json(redactSdkSurfaceReplay(session, runtime.trusted));
       } catch (err) {
         if (err instanceof RequestedSessionIdAdmissionError) {
           sendRequestedSessionIdAdmissionError(res, err, route);
@@ -3592,21 +4006,23 @@ export function registerSessionRoutes(
     });
     if (!runtime) return;
     try {
-      const resolved = await virtualSubagentSessions.resolve(
-        runtime,
-        sessionId,
-        subagentRef,
-      );
-      if (!resolved) {
-        res.status(404).json({
-          error: 'Subagent session not found',
-          code: 'session_not_found',
+      await runOwnerRuntimeActivity(runtime, async () => {
+        const resolved = await virtualSubagentSessions.resolve(
+          runtime,
           sessionId,
           subagentRef,
-        });
-        return;
-      }
-      res.status(200).set('Cache-Control', 'no-store').json(resolved);
+        );
+        if (!resolved) {
+          res.status(404).json({
+            error: 'Subagent session not found',
+            code: 'session_not_found',
+            sessionId,
+            subagentRef,
+          });
+          return;
+        }
+        res.status(200).set('Cache-Control', 'no-store').json(resolved);
+      });
     } catch (err) {
       sendBridgeError(res, err, { route, sessionId });
     }
@@ -3647,29 +4063,31 @@ export function registerSessionRoutes(
       });
       if (!runtime) return;
       try {
-        const resolved = await virtualSubagentSessions.resolve(
-          runtime,
-          sessionId,
-          subagentRef,
-        );
-        if (!resolved) {
-          res.status(404).json({
-            error: 'Subagent session not found',
-            code: 'session_not_found',
+        await runOwnerRuntimeActivity(runtime, async () => {
+          const resolved = await virtualSubagentSessions.resolve(
+            runtime,
             sessionId,
             subagentRef,
-          });
-          return;
-        }
-        res
-          .status(200)
-          .json(
-            await runtime.bridge.cancelSessionTask(
-              sessionId,
-              resolved.taskId,
-              'agent',
-            ),
           );
+          if (!resolved) {
+            res.status(404).json({
+              error: 'Subagent session not found',
+              code: 'session_not_found',
+              sessionId,
+              subagentRef,
+            });
+            return;
+          }
+          res
+            .status(200)
+            .json(
+              await runtime.bridge.cancelSessionTask(
+                sessionId,
+                resolved.taskId,
+                'agent',
+              ),
+            );
+        });
       } catch (err) {
         sendBridgeError(res, err, { route, sessionId });
       }
@@ -3737,9 +4155,13 @@ export function registerSessionRoutes(
         res
           .status(201)
           .json(
-            omitSkillDetailsFromReplayArrays(result as BridgeBranchedSession),
+            redactSdkSurfaceReplay(
+              result as BridgeBranchedSession,
+              runtime.trusted,
+            ),
           );
       },
+      { rejectStandalone: true },
     ),
   );
 
@@ -3806,8 +4228,9 @@ export function registerSessionRoutes(
           }
           return;
         }
-        res.status(201).json(omitSkillDetailsFromReplayArrays(result));
+        res.status(201).json(redactSdkSurfaceReplay(result, runtime.trusted));
       },
+      { rejectStandalone: true },
     ),
   );
 
@@ -3845,6 +4268,7 @@ export function registerSessionRoutes(
         }
         res.status(202).json(result);
       },
+      { cwdBound: true },
     ),
   );
 
@@ -3878,27 +4302,19 @@ export function registerSessionRoutes(
         runtime.generationGuard?.assertOpen();
         res.status(200).json(result);
       },
+      { rejectStandalone: true },
     ),
   );
 
-  app.get('/session/:id/status', (req, res) => {
-    const sessionId = requireSessionId(req, res);
-    if (sessionId === null) return;
-    const runtime = resolveLiveSessionRuntime(
-      sessionId,
-      res,
+  app.get(
+    '/session/:id/status',
+    withOwnerReadSession(
       'GET /session/:id/status',
-    );
-    if (!runtime) return;
-    try {
-      res.status(200).json(runtime.bridge.getSessionSummary(sessionId));
-    } catch (err) {
-      sendBridgeError(res, err, {
-        route: 'GET /session/:id/status',
-        sessionId,
-      });
-    }
-  });
+      (_req, res, sessionId, runtime) => {
+        res.status(200).json(runtime.bridge.getSessionSummary(sessionId));
+      },
+    ),
+  );
 
   app.get('/session/:id/export', async (req, res) => {
     await handleSessionExport(req, res, {
@@ -3965,6 +4381,7 @@ export function registerSessionRoutes(
       return;
     }
 
+    let workspaceTrusted = false;
     try {
       const result = await archiveCoordinator.runSharedMany(
         [sessionId],
@@ -3976,6 +4393,7 @@ export function registerSessionRoutes(
             cursor !== undefined,
           );
           if (!runtime) return undefined;
+          workspaceTrusted = runtime.trusted;
           captureRuntimeGenerationAssertion(runtime)?.();
           return runtime.bridge.getSessionTranscriptPage({
             sessionId,
@@ -3991,7 +4409,9 @@ export function registerSessionRoutes(
         .set('Cache-Control', 'no-store')
         .json({
           ...result,
-          events: (result.events ?? []).map(omitSkillDetailsForSdkSurface),
+          events: (result.events ?? []).map((event) =>
+            redactSdkSurfaceEvent(event, workspaceTrusted),
+          ),
         });
     } catch (err) {
       sendBridgeError(res, err, {
@@ -4120,11 +4540,14 @@ export function registerSessionRoutes(
               v: 1 as const,
               sessionId,
               events: replay.updates.map((update) =>
-                omitSkillDetailsForSdkSurface({
-                  v: 1 as const,
-                  type: 'session_update' as const,
-                  data: update,
-                }),
+                redactSdkSurfaceEvent(
+                  {
+                    v: 1 as const,
+                    type: 'session_update' as const,
+                    data: update,
+                  },
+                  runtime.trusted,
+                ),
               ),
               ...(replay.nextCursor && !cursorTooLarge
                 ? { nextCursor: replay.nextCursor }
@@ -4161,7 +4584,7 @@ export function registerSessionRoutes(
 
   app.get(
     '/session/:id/context',
-    (req, res, next) => {
+    async (req, res, next) => {
       const sessionId = req.params['id'];
       const key = sessionId
         ? parseVirtualSubagentSessionId(sessionId)
@@ -4178,12 +4601,21 @@ export function registerSessionRoutes(
         daemonLog,
       });
       if (!runtime) return;
-      res.status(200).json({
-        v: 1,
-        sessionId,
-        workspaceCwd: runtime.workspaceCwd,
-        state: {},
-      });
+      try {
+        await runOwnerRuntimeActivity(runtime, async () => {
+          res.status(200).json({
+            v: 1,
+            sessionId,
+            workspaceCwd: runtime.workspaceCwd,
+            state: {},
+          });
+        });
+      } catch (err) {
+        sendBridgeError(res, err, {
+          route: 'GET /session/:id/context',
+          sessionId,
+        });
+      }
     },
     withOwnerReadSession(
       'GET /session/:id/context',
@@ -4216,6 +4648,7 @@ export function registerSessionRoutes(
       async (_req, res, sessionId, runtime) => {
         res
           .status(200)
+          .set('Cache-Control', 'no-store')
           .json(await runtime.bridge.getSessionStatsStatus(sessionId));
       },
     ),
@@ -4223,7 +4656,7 @@ export function registerSessionRoutes(
 
   app.get(
     '/session/:id/supported-commands',
-    (req, res, next) => {
+    async (req, res, next) => {
       const sessionId = req.params['id'];
       const key = sessionId
         ? parseVirtualSubagentSessionId(sessionId)
@@ -4240,20 +4673,33 @@ export function registerSessionRoutes(
         daemonLog,
       });
       if (!runtime) return;
-      res.status(200).json({
-        v: 1,
-        sessionId,
-        availableCommands: [],
-        availableSkills: [],
-      });
+      try {
+        await runOwnerRuntimeActivity(runtime, async () => {
+          res.status(200).json({
+            v: 1,
+            sessionId,
+            availableCommands: [],
+            availableSkills: [],
+          });
+        });
+      } catch (err) {
+        sendBridgeError(res, err, {
+          route: 'GET /session/:id/supported-commands',
+          sessionId,
+        });
+      }
     },
     withOwnerReadSession(
       'GET /session/:id/supported-commands',
       async (_req, res, sessionId, runtime) => {
+        const status =
+          await runtime.bridge.getSessionSupportedCommandsStatus(sessionId);
         res
           .status(200)
           .json(
-            await runtime.bridge.getSessionSupportedCommandsStatus(sessionId),
+            runtime.trusted
+              ? status
+              : redactWorkflowsFromSupportedCommands(status),
           );
       },
     ),
@@ -4263,10 +4709,16 @@ export function registerSessionRoutes(
     '/session/:id/tasks',
     withOwnerReadSession(
       'GET /session/:id/tasks',
-      async (_req, res, sessionId, runtime) => {
-        res
-          .status(200)
-          .json(await runtime.bridge.getSessionTasksStatus(sessionId));
+      async (req, res, sessionId, runtime) => {
+        res.status(200).json(
+          await runtime.bridge.getSessionTasksStatus(sessionId, {
+            // Same fail-closed shape as the workflow control surfaces:
+            // opting in here leaks strictly more than the redacted
+            // supported-commands surface on an untrusted workspace.
+            includeWorkflows:
+              runtime.trusted && req.query['includeWorkflows'] === 'true',
+          }),
+        );
       },
     ),
   );
@@ -4312,6 +4764,7 @@ export function registerSessionRoutes(
             ),
           );
       },
+      { cwdBound: true },
     ),
   );
 
@@ -4360,6 +4813,7 @@ export function registerSessionRoutes(
           });
         }
       },
+      { cwdBound: 'always' },
     ),
   );
 
@@ -4417,16 +4871,80 @@ export function registerSessionRoutes(
         }
         const body = safeBody(req);
         const kind = body['kind'];
-        if (kind !== 'agent' && kind !== 'shell' && kind !== 'monitor') {
-          res
-            .status(400)
-            .json({ error: '`kind` must be "agent", "shell", or "monitor"' });
+        if (
+          kind !== 'agent' &&
+          kind !== 'shell' &&
+          kind !== 'monitor' &&
+          kind !== 'workflow'
+        ) {
+          res.status(400).json({
+            error: '`kind` must be "agent", "shell", "monitor", or "workflow"',
+          });
           return;
         }
+        if (kind === 'workflow' && !runtime.trusted) {
+          res.status(200).json({ cancelled: false, reason: 'disabled' });
+          return;
+        }
+        const clientId = parseClientIdHeader(req, res);
+        if (clientId === null) return;
         res
           .status(200)
           .json(
-            await runtime.bridge.cancelSessionTask(sessionId, taskId, kind),
+            await runtime.bridge.cancelSessionTask(
+              sessionId,
+              taskId,
+              kind,
+              clientId !== undefined ? { clientId } : undefined,
+            ),
+          );
+      },
+    ),
+  );
+
+  app.post(
+    '/session/:id/tasks/:taskId/workflow-action',
+    mutate({ strict: true }),
+    withOwnerMutableSession(
+      'POST /session/:id/tasks/:taskId/workflow-action',
+      async (req, res, sessionId, runtime) => {
+        const taskId = req.params['taskId'];
+        if (!taskId) {
+          res.status(400).json({
+            error: '`taskId` route parameter is required',
+          });
+          return;
+        }
+        const action = safeBody(req)['action'];
+        if (
+          action !== 'pause' &&
+          action !== 'resume' &&
+          action !== 'retry' &&
+          action !== 'rerun' &&
+          action !== 'delete-history' &&
+          action !== 'run-saved'
+        ) {
+          res.status(400).json({
+            error:
+              '`action` must be "pause", "resume", "retry", "rerun", "delete-history", or "run-saved"',
+          });
+          return;
+        }
+        if (!runtime.trusted) {
+          res.status(200).json({ changed: false });
+          return;
+        }
+        const clientId = parseClientIdHeader(req, res);
+        if (clientId === null) return;
+        res
+          .status(200)
+          .json(
+            await runtime.bridge.controlSessionWorkflowTask(
+              sessionId,
+              taskId,
+              action,
+              clientId !== undefined ? { clientId } : undefined,
+            ),
           );
       },
     ),
@@ -4509,6 +5027,7 @@ export function registerSessionRoutes(
         }
         res.status(200).json(result);
       },
+      { cwdBound: 'always' },
     ),
   );
 
@@ -4645,7 +5164,7 @@ export function registerSessionRoutes(
     mutate(),
     withOwnerMutableSession(
       'POST /session/:id/prompt',
-      async (req, res, sessionId, runtime) => {
+      async (req, res, sessionId, runtime, onPromptAdmitted) => {
         const ownerBridge = runtime.bridge;
         const body = safeBody(req);
         const prompt = body['prompt'];
@@ -4830,6 +5349,7 @@ export function registerSessionRoutes(
                     },
                   }
                 : {}),
+              ...(onPromptAdmitted !== undefined ? { onPromptAdmitted } : {}),
             },
           );
         } catch (err) {
@@ -4904,6 +5424,7 @@ export function registerSessionRoutes(
         }
         res.status(202).json({ promptId, lastEventId, eventEpoch });
       },
+      { promptAdmission: true },
     ),
   );
 
@@ -5002,7 +5523,7 @@ export function registerSessionRoutes(
   app.post(
     '/session/:id/heartbeat',
     mutate(),
-    (req, res, next) => {
+    async (req, res, next) => {
       const sessionId = req.params['id'];
       const key = sessionId
         ? parseVirtualSubagentSessionId(sessionId)
@@ -5021,11 +5542,20 @@ export function registerSessionRoutes(
       if (!runtime) return;
       const clientId = parseClientIdHeader(req, res);
       if (clientId === null) return;
-      res.status(200).json({
-        sessionId,
-        ...(clientId ? { clientId } : {}),
-        lastSeenAt: Date.now(),
-      });
+      try {
+        await runOwnerRuntimeActivity(runtime, async () => {
+          res.status(200).json({
+            sessionId,
+            ...(clientId ? { clientId } : {}),
+            lastSeenAt: Date.now(),
+          });
+        });
+      } catch (err) {
+        sendBridgeError(res, err, {
+          route: 'POST /session/:id/heartbeat',
+          sessionId,
+        });
+      }
     },
     withOwnerMutableSession(
       'POST /session/:id/heartbeat',
@@ -5044,7 +5574,7 @@ export function registerSessionRoutes(
   app.post(
     '/session/:id/detach',
     mutate(),
-    (req, res, next) => {
+    async (req, res, next) => {
       const sessionId = req.params['id'];
       const key = sessionId
         ? parseVirtualSubagentSessionId(sessionId)
@@ -5063,7 +5593,16 @@ export function registerSessionRoutes(
       if (!runtime) return;
       const clientId = parseClientIdHeader(req, res);
       if (clientId === null) return;
-      res.status(204).end();
+      try {
+        await runOwnerRuntimeActivity(runtime, async () => {
+          res.status(204).end();
+        });
+      } catch (err) {
+        sendBridgeError(res, err, {
+          route: 'POST /session/:id/detach',
+          sessionId,
+        });
+      }
     },
     withOwnerMutableSession(
       'POST /session/:id/detach',
@@ -5106,20 +5645,23 @@ export function registerSessionRoutes(
     if (rejectActiveLiveSessionMutation(res, [sessionId])) return;
     const clientId = parseClientIdHeader(req, res);
     if (clientId === null) return;
-    const runtime = resolveLiveSessionRuntime(
-      sessionId,
-      res,
-      'DELETE /session/:id',
-    );
-    if (!runtime) return;
     try {
+      const owner = await resolveOwnerSessionRuntime(
+        sessionId,
+        res,
+        'DELETE /session/:id',
+      );
+      if (!owner) return;
+      const { runtime } = owner;
       // ACP session/close can fall back to a shared gate because it has
       // connection-local promptAbort state; REST close does not.
-      await runWithSessionListInvalidation(runtime, ['active'], () =>
-        archiveCoordinator.runExclusiveMany([sessionId], async () =>
-          runtime.bridge.closeSession(
-            sessionId,
-            clientId !== undefined ? { clientId } : undefined,
+      await runOwnerRuntimeActivity(runtime, () =>
+        runWithSessionListInvalidation(runtime, ['active'], () =>
+          archiveCoordinator.runExclusiveMany([sessionId], async () =>
+            runtime.bridge.closeSession(
+              sessionId,
+              clientId !== undefined ? { clientId } : undefined,
+            ),
           ),
         ),
       );
@@ -5165,6 +5707,8 @@ export function registerSessionRoutes(
   app.post('/sessions/archive', mutate(), async (req, res) => {
     const uniqueIds = parseSessionIdsBody(req, res);
     if (uniqueIds === undefined) return;
+    const resolveConflicts = parseResolveConflicts(req, res);
+    if (resolveConflicts === undefined) return;
     if (rejectActiveLiveSessionMutation(res, uniqueIds)) return;
 
     try {
@@ -5173,12 +5717,14 @@ export function registerSessionRoutes(
         res,
         'POST /sessions/archive',
         uniqueIds,
+        resolveConflicts,
       );
       if (!operation) return;
       const { result } = operation;
       res.status(200).json({
         archived: result.archived,
         alreadyArchived: result.alreadyArchived,
+        resolvedConflicts: result.resolvedConflicts,
         notFound: result.notFound,
         errors: serializeSessionErrors(result.errors, operation.internal),
       });
@@ -5190,6 +5736,8 @@ export function registerSessionRoutes(
   app.post('/sessions/unarchive', mutate(), async (req, res) => {
     const uniqueIds = parseSessionIdsBody(req, res);
     if (uniqueIds === undefined) return;
+    const resolveConflicts = parseResolveConflicts(req, res);
+    if (resolveConflicts === undefined) return;
 
     try {
       const operation = await unarchiveSessions(
@@ -5197,12 +5745,14 @@ export function registerSessionRoutes(
         res,
         'POST /sessions/unarchive',
         uniqueIds,
+        resolveConflicts,
       );
       if (!operation) return;
       const { result } = operation;
       res.status(200).json({
         unarchived: result.unarchived,
         alreadyActive: result.alreadyActive,
+        resolvedConflicts: result.resolvedConflicts,
         notFound: result.notFound,
         errors: serializeSessionErrors(result.errors, operation.internal),
       });
@@ -5247,14 +5797,23 @@ export function registerSessionRoutes(
       const route = 'POST /workspaces/:workspace/sessions/archive';
       const uniqueIds = parseSessionIdsBody(req, res);
       if (uniqueIds === undefined) return;
+      const resolveConflicts = parseResolveConflicts(req, res);
+      if (resolveConflicts === undefined) return;
       if (rejectActiveLiveSessionMutation(res, uniqueIds)) return;
       try {
-        const operation = await archiveSessions(req, res, route, uniqueIds);
+        const operation = await archiveSessions(
+          req,
+          res,
+          route,
+          uniqueIds,
+          resolveConflicts,
+        );
         if (!operation) return;
         const { result } = operation;
         res.status(200).json({
           archived: result.archived,
           alreadyArchived: result.alreadyArchived,
+          resolvedConflicts: result.resolvedConflicts,
           notFound: result.notFound,
           errors: serializeSessionErrors(result.errors, operation.internal),
         });
@@ -5271,13 +5830,22 @@ export function registerSessionRoutes(
       const route = 'POST /workspaces/:workspace/sessions/unarchive';
       const uniqueIds = parseSessionIdsBody(req, res);
       if (uniqueIds === undefined) return;
+      const resolveConflicts = parseResolveConflicts(req, res);
+      if (resolveConflicts === undefined) return;
       try {
-        const operation = await unarchiveSessions(req, res, route, uniqueIds);
+        const operation = await unarchiveSessions(
+          req,
+          res,
+          route,
+          uniqueIds,
+          resolveConflicts,
+        );
         if (!operation) return;
         const { result } = operation;
         res.status(200).json({
           unarchived: result.unarchived,
           alreadyActive: result.alreadyActive,
+          resolvedConflicts: result.resolvedConflicts,
           notFound: result.notFound,
           errors: serializeSessionErrors(result.errors, operation.internal),
         });
@@ -5385,7 +5953,11 @@ export function registerSessionRoutes(
                 service.getPrSessionPathForArchiveState(sessionId, 'active'),
                 pr,
               )
-            ).map(({ number, url }) => ({ number, url }));
+            ).map(({ number, url, state }) => ({
+              number,
+              url,
+              ...(state ? { state } : {}),
+            }));
             effective = { ...effective, prs: persistedPrs };
           }
         } finally {
@@ -5512,7 +6084,11 @@ export function registerSessionRoutes(
             let effective: {
               displayName?: string;
               titleSource?: 'manual' | 'auto';
-              prs?: Array<{ number: number; url: string }>;
+              prs?: Array<{
+                number: number;
+                url: string;
+                state?: 'open' | 'merged' | 'closed';
+              }>;
             };
             const service = createWorkspaceRuntimeSessionService(runtime);
             try {
@@ -5565,7 +6141,11 @@ export function registerSessionRoutes(
                     ),
                     pr,
                   )
-                ).map(({ number, url }) => ({ number, url }));
+                ).map(({ number, url, state }) => ({
+                  number,
+                  url,
+                  ...(state ? { state } : {}),
+                }));
                 assertRuntimeGenerationOpen?.();
                 effective = { ...effective, prs: persistedPrs };
               }
@@ -5592,9 +6172,10 @@ export function registerSessionRoutes(
                   pr,
                 );
                 assertRuntimeGenerationOpen?.();
-                effective.prs = persisted.map(({ number, url }) => ({
+                effective.prs = persisted.map(({ number, url, state }) => ({
                   number,
                   url,
+                  ...(state ? { state } : {}),
                 }));
                 persistedWrite = true;
               }
@@ -6175,12 +6756,14 @@ export function registerSessionRoutes(
                     },
                   ),
                 )
-              : Promise.resolve(
-                  listLiveWorkspaceSessionsForResponse(
-                    runtime.bridge,
-                    key,
-                    options,
-                  ),
+              : listLiveWorkspaceSessionsForResponse(
+                  runtime.bridge,
+                  key,
+                  options,
+                  {
+                    runtimeBaseDir: runtime.sessionRuntimeBaseDir,
+                    signal: controller.signal,
+                  },
                 );
           const result =
             liveRuntime && deps.conversationRuntimeActivity
@@ -6619,50 +7202,38 @@ export function registerSessionRoutes(
   // terminal id rings. Query-capable clients project it after refresh,
   // session switches, or missed events. Older daemons lack this route and
   // retain the legacy client-side fallback.
-  app.get('/session/:id/mid-turn-messages', (req, res) => {
-    const route = 'GET /session/:id/mid-turn-messages';
-    const sessionId = requireSessionId(req, res);
-    if (sessionId === null) return;
-    const runtime = resolveLiveSessionRuntime(sessionId, res, route);
-    if (!runtime) return;
-    const clientId = parseClientIdHeader(req, res);
-    if (clientId === null) return;
-    try {
-      const snapshot = runtime.bridge.getMidTurnMessages(
-        sessionId,
-        clientId !== undefined ? { clientId } : undefined,
-      );
-      res.status(200).json(snapshot);
-    } catch (err) {
-      sendBridgeError(res, err, { route, sessionId });
-    }
-  });
+  app.get(
+    '/session/:id/mid-turn-messages',
+    withOwnerReadSession(
+      'GET /session/:id/mid-turn-messages',
+      (req, res, sessionId, runtime) => {
+        const clientId = parseClientIdHeader(req, res);
+        if (clientId === null) return;
+        const snapshot = runtime.bridge.getMidTurnMessages(
+          sessionId,
+          clientId !== undefined ? { clientId } : undefined,
+        );
+        res.status(200).json(snapshot);
+      },
+    ),
+  );
 
   // Pending prompt queue: list and remove.
-  app.get('/session/:id/pending-prompts', (req, res) => {
-    const sessionId = requireSessionId(req, res);
-    if (sessionId === null) return;
-    const runtime = resolveLiveSessionRuntime(
-      sessionId,
-      res,
+  app.get(
+    '/session/:id/pending-prompts',
+    withOwnerReadSession(
       'GET /session/:id/pending-prompts',
-    );
-    if (!runtime) return;
-    const clientId = parseClientIdHeader(req, res);
-    if (clientId === null) return;
-    try {
-      const pendingPrompts = runtime.bridge.getPendingPrompts(
-        sessionId,
-        clientId !== undefined ? { clientId } : undefined,
-      );
-      res.status(200).json({ pendingPrompts });
-    } catch (err) {
-      sendBridgeError(res, err, {
-        route: 'GET /session/:id/pending-prompts',
-        sessionId,
-      });
-    }
-  });
+      (req, res, sessionId, runtime) => {
+        const clientId = parseClientIdHeader(req, res);
+        if (clientId === null) return;
+        const pendingPrompts = runtime.bridge.getPendingPrompts(
+          sessionId,
+          clientId !== undefined ? { clientId } : undefined,
+        );
+        res.status(200).json({ pendingPrompts });
+      },
+    ),
+  );
 
   app.delete(
     '/session/:id/pending-prompts/:promptId',
@@ -6690,51 +7261,36 @@ export function registerSessionRoutes(
   );
 
   // Register `current` before the parameter route so it is not a promptId.
-  app.get('/session/:id/turns/current', (req, res) => {
-    const sessionId = requireSessionId(req, res);
-    if (sessionId === null) return;
-    const runtime = resolveLiveSessionRuntime(
-      sessionId,
-      res,
+  app.get(
+    '/session/:id/turns/current',
+    withOwnerReadSession(
       'GET /session/:id/turns/current',
-    );
-    if (!runtime) return;
-    const clientId = parseClientIdHeader(req, res);
-    if (clientId === null) return;
-    void (async () => {
-      try {
+      async (req, res, sessionId, runtime) => {
+        const clientId = parseClientIdHeader(req, res);
+        if (clientId === null) return;
         const status = await runtime.bridge.getSessionTurnStatus(
           sessionId,
           clientId !== undefined ? { clientId } : undefined,
         );
         res.status(200).json(status);
-      } catch (err) {
-        sendBridgeError(res, err, {
-          route: 'GET /session/:id/turns/current',
-          sessionId,
-        });
-      }
-    })();
-  });
+      },
+    ),
+  );
 
-  app.get('/session/:id/turns/:promptId', (req, res) => {
-    const sessionId = requireSessionId(req, res);
-    if (sessionId === null) return;
-    const runtime = resolveLiveSessionRuntime(
-      sessionId,
-      res,
+  app.get(
+    '/session/:id/turns/:promptId',
+    withOwnerReadSession(
       'GET /session/:id/turns/:promptId',
-    );
-    if (!runtime) return;
-    const promptId = req.params['promptId'];
-    if (!promptId) {
-      res.status(400).json({ error: '`promptId` route parameter is required' });
-      return;
-    }
-    const clientId = parseClientIdHeader(req, res);
-    if (clientId === null) return;
-    void (async () => {
-      try {
+      async (req, res, sessionId, runtime) => {
+        const promptId = req.params['promptId'];
+        if (!promptId) {
+          res
+            .status(400)
+            .json({ error: '`promptId` route parameter is required' });
+          return;
+        }
+        const clientId = parseClientIdHeader(req, res);
+        if (clientId === null) return;
         const status = await runtime.bridge.getSessionTurnStatus(
           sessionId,
           clientId !== undefined ? { clientId } : undefined,
@@ -6750,14 +7306,9 @@ export function registerSessionRoutes(
           return;
         }
         res.status(200).json(status);
-      } catch (err) {
-        sendBridgeError(res, err, {
-          route: 'GET /session/:id/turns/:promptId',
-          sessionId,
-        });
-      }
-    })();
-  });
+      },
+    ),
+  );
 
   app.post(
     '/session/:id/shell',
@@ -6829,6 +7380,7 @@ export function registerSessionRoutes(
           res.off('close', onResClose);
         }
       },
+      { cwdBound: 'always' },
     ),
   );
 
@@ -6895,6 +7447,7 @@ export function registerSessionRoutes(
         }
         res.status(200).json(response);
       },
+      { cwdBound: 'rewind-files' },
     ),
   );
 
@@ -6988,6 +7541,7 @@ export function registerSessionRoutes(
         );
         res.status(200).json(response);
       },
+      { cwdBound: 'sync-output-language' },
     ),
   );
 }

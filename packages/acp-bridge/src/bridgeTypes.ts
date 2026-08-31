@@ -46,6 +46,7 @@ import type {
   ServeSessionLspStatus,
   ServeSessionSupportedCommandsStatus,
   ServeSessionTasksStatus,
+  ServeSessionWorkflowTaskStatus,
   ServeWorkspaceExtensionsStatus,
   ServeWorkspaceHooksStatus,
   ServeWorkspaceMcpToolsStatus,
@@ -165,6 +166,19 @@ export interface BridgeSpawnRequest {
   sessionId?: string;
 }
 
+/** Internal daemon-only creation surface for a managed standalone session. */
+export interface BridgeStandaloneSpawnRequest {
+  /** Runtime ownership root inherited only during provisional bootstrap. */
+  workspaceCwd: string;
+  /** Daemon-reserved canonical session id for the managed child directory. */
+  sessionId: string;
+  /** Explicit standalone parent lineage for a depth-1 sub-session. */
+  parentSessionId?: string;
+  /** Optional explicit model service id; falls back to settings default. */
+  modelServiceId?: string;
+  approvalMode?: ApprovalMode;
+}
+
 export interface BridgeSession {
   sessionId: string;
   /**
@@ -245,6 +259,12 @@ export interface BridgeRestoreSessionRequest {
   titleSource?: 'manual' | 'auto';
 }
 
+/** Internal daemon-only restore surface for a managed standalone session. */
+export type BridgeStandaloneRestoreSessionRequest = Omit<
+  BridgeRestoreSessionRequest,
+  'sourceType' | 'sourceId'
+>;
+
 export const LOAD_REPLAY_MODE_META_KEY = 'qwen.session.loadReplayMode';
 export const LOAD_REPLAY_META_KEY = 'qwen.session.loadReplay';
 export const LOAD_REPLAY_PAGE_SIZE_META_KEY = 'qwen.session.loadReplayPageSize';
@@ -256,10 +276,16 @@ export const LOAD_REPLAY_MAX_BYTES = 32 * 1024 * 1024;
 export const LOAD_REPLAY_MAX_UPDATES = 10_000;
 
 export const REQUESTED_SESSION_ID_META_KEY = 'qwen-code/sessionId';
+export const SESSION_INITIALIZATION_DEADLINE_META_KEY =
+  'qwen.daemon.sessionInitializationDeadlineMs';
+export const SESSION_INITIALIZATION_TIMEOUT_ERROR_KIND =
+  'session_initialization_timeout';
 
 export const CHANNEL_STARTUP_PROFILE_META_KEY =
   'qwen.daemon.channelStartupProfile';
 export const CHANNEL_STARTUP_PROFILE_VERSION = 1 as const;
+export const CHANNEL_LIVENESS_META_KEY = 'qwen.daemon.channelLiveness';
+export const CHANNEL_LIVENESS_VERSION = 1 as const;
 export const ACTIVE_WORK_HEARTBEAT_META_KEY = 'qwen.daemon.activeWorkHeartbeat';
 export const ACTIVE_WORK_HEARTBEAT_VERSION = 1 as const;
 /** Reporting cadence the daemon asks for; the child may choose another value
@@ -299,11 +325,15 @@ export const ACTIVE_WORK_MAX_SESSION_HOLDS = 1024;
 export const WORKTREE_MCP_DEFER_META_KEY = 'qwen.session.deferMcpDiscovery';
 
 /**
- * Work categories a child reports holds for. Monitors, workflows, and cron
- * remain outside `activeWork`'s declared scope. The category travels on every
+ * Work categories a child reports holds for. Monitors and cron remain outside
+ * `activeWork`'s declared scope. The category travels on every
  * hold so peers can negotiate coverage explicitly when the scope widens.
  */
-export type ActiveWorkHoldCategory = 'agent' | 'notification' | 'shell';
+export type ActiveWorkHoldCategory =
+  | 'agent'
+  | 'notification'
+  | 'shell'
+  | 'workflow';
 
 /** Categories understood by active-work v1 before category negotiation was
  * added to the daemon's initialize request. */
@@ -314,6 +344,7 @@ export const ACTIVE_WORK_HOLD_CATEGORIES: readonly ActiveWorkHoldCategory[] = [
   'agent',
   'notification',
   'shell',
+  'workflow',
 ];
 
 export interface ActiveWorkHeartbeatCapabilityV1 {
@@ -539,6 +570,21 @@ export interface BridgeForkAgentResult {
   launched: boolean;
 }
 
+export interface BridgeConversationDirectoryExpectation {
+  canonicalSessionId: string;
+  root: {
+    canonicalPath: string;
+    device: number;
+    inode: number;
+  };
+  child: {
+    name: string;
+    canonicalPath: string;
+    device: number;
+    inode: number;
+  };
+}
+
 export interface ChangeSessionCwdRequest {
   path: string;
   /**
@@ -555,6 +601,12 @@ export interface ChangeSessionCwdRequest {
    * before this may bypass the independent global folder-trust registry.
    */
   managedRelocation?: 'live-conversation';
+  /**
+   * Exact daemon-pinned identity for a standalone Conversations child.
+   * The bridge forwards this proof verbatim; the ACP child validates it
+   * before and after mutating the session Config.
+   */
+  conversationDirectoryExpectation?: BridgeConversationDirectoryExpectation;
 }
 
 export interface ChangeSessionCwdResult {
@@ -565,6 +617,7 @@ export interface ChangeSessionCwdResult {
 }
 
 export type BridgeWorkspaceMemoryRememberContextMode = 'workspace' | 'clean';
+export type BridgeWorkspaceMemoryRememberTargetScope = 'project' | 'user';
 export type BridgeAutoMemoryTopic =
   | 'user'
   | 'feedback'
@@ -574,6 +627,7 @@ export type BridgeAutoMemoryTopic =
 export interface BridgeWorkspaceMemoryRememberRequest {
   content: string;
   contextMode: BridgeWorkspaceMemoryRememberContextMode;
+  scope?: BridgeWorkspaceMemoryRememberTargetScope;
 }
 
 export interface BridgeWorkspaceMemoryRememberResult {
@@ -584,6 +638,7 @@ export interface BridgeWorkspaceMemoryRememberResult {
 
 export interface BridgeWorkspaceMemoryForgetRequest {
   query: string;
+  scope?: BridgeWorkspaceMemoryRememberTargetScope;
 }
 
 export interface BridgeWorkspaceMemoryForgetMatch {
@@ -647,6 +702,13 @@ export interface BridgePendingUserQuestionInteraction {
   title?: string;
   questions: BridgePendingUserQuestion[];
   options: BridgePendingInteractionOption[];
+}
+
+export interface BridgeWorkspaceRuntimeLifecycleSnapshot {
+  state: 'cold' | 'starting' | 'active' | 'idle' | 'stopping';
+  runtimeLive: boolean;
+  runtimeEpoch: number;
+  activeWork: boolean;
 }
 
 export type BridgePendingInteraction =
@@ -737,6 +799,8 @@ export interface BridgeSessionGoal {
 export interface SessionPrInfo {
   number: number;
   url: string;
+  /** Snapshot of the PR's state at last bind/refresh; optional. */
+  state?: 'open' | 'merged' | 'closed';
 }
 
 export interface SessionMetadataUpdate {
@@ -1278,7 +1342,24 @@ export type RuntimeMcpServerRemoveResult =
     }
   | { name: string; skipped: true; reason: 'not_present' };
 
-export interface AcpSessionBridge {
+export interface WorkspaceEventPublisher {
+  /**
+   * Workspace-level event fan-out for mutations that change daemon-wide state.
+   * Best-effort per session; closed buses silently skipped.
+   */
+  publishWorkspaceEvent(event: Omit<BridgeEvent, 'id' | 'v'>): void;
+}
+
+export interface WorkspaceEventBridge extends WorkspaceEventPublisher {
+  /**
+   * Union of every live session's `clientIds`. Used by workspace-level
+   * mutation routes to validate the optional `X-Qwen-Client-Id` header.
+   * Returns a snapshot — callers must not mutate.
+   */
+  knownClientIds(): ReadonlySet<string>;
+}
+
+export interface AcpSessionBridge extends WorkspaceEventBridge {
   /** Read-only daemon diagnostics for status endpoints. */
   getDaemonStatusSnapshot(): BridgeDaemonStatusSnapshot;
 
@@ -1310,6 +1391,17 @@ export interface AcpSessionBridge {
    * existing session for the same workspace.
    */
   spawnOrAttach(req: BridgeSpawnRequest): Promise<BridgeSession>;
+
+  /** Create a fresh daemon-owned standalone session in provisional mode. */
+  spawnStandaloneSession(
+    req: BridgeStandaloneSpawnRequest,
+  ): Promise<BridgeSession>;
+
+  /** Restore a daemon-owned standalone session in provisional mode. */
+  restoreStandaloneSession(
+    action: 'load' | 'resume',
+    req: BridgeStandaloneRestoreSessionRequest,
+  ): Promise<BridgeRestoredSession>;
 
   /**
    * Load an existing persisted session and replay its history through
@@ -1355,6 +1447,16 @@ export interface AcpSessionBridge {
     req: ChangeSessionCwdRequest,
     context?: BridgeClientRequestContext,
   ): Promise<ChangeSessionCwdResult>;
+
+  commitManagedConversationBinding(
+    sessionId: string,
+    expectation: BridgeConversationDirectoryExpectation,
+  ): Promise<void>;
+
+  releaseManagedConversationBinding(
+    sessionId: string,
+    expectation: BridgeConversationDirectoryExpectation,
+  ): Promise<void>;
 
   /**
    * Set worktree metadata on an existing session entry. Used when
@@ -1451,6 +1553,12 @@ export interface AcpSessionBridge {
   getSessionEventEpoch(sessionId: string): string;
 
   /**
+   * Return the daemon's current effective cwd for a live session without
+   * exposing it through public session summaries.
+   */
+  getSessionCurrentCwd(sessionId: string): string;
+
+  /**
    * Return the current compacted replay snapshot for a loaded session, when
    * the bridge has a compaction engine configured.
    */
@@ -1467,6 +1575,9 @@ export interface AcpSessionBridge {
     context?: BridgeClientRequestContext,
     opts?: CloseSessionOpts,
   ): Promise<void>;
+
+  /** Durably anchor an eligible live default session before task binding. */
+  ensureDefaultSessionPersisted?(sessionId: string): Promise<void>;
 
   /**
    * Update mutable session metadata. Supports `displayName`, `titleSource`,
@@ -1488,6 +1599,17 @@ export interface AcpSessionBridge {
    * storage-agnostic. Optional so lightweight fakes may omit it.
    */
   seedSessionPrs?(sessionId: string, prs: SessionPrInfo[]): void;
+
+  /**
+   * Replace the in-memory PR binding list of a live session with the
+   * persisted sidecar contents after a rewrite that can evict bindings
+   * (the backfill cap trim). Unlike {@link seedSessionPrs}, overwrites an
+   * entry that already holds bindings, so the summary merge cannot
+   * resurrect evicted numbers from a stale entry. No-op when the entry is
+   * unknown (session not live). Callers own sidecar I/O; the bridge stays
+   * storage-agnostic. Optional so lightweight fakes may omit it.
+   */
+  setSessionPrs?(sessionId: string, prs: SessionPrInfo[]): void;
 
   /**
    * List the structured artifacts registered for a live session. Throws
@@ -1583,19 +1705,6 @@ export interface AcpSessionBridge {
    * Returns `undefined` for unknown sessions.
    */
   getHeartbeatState(sessionId: string): BridgeHeartbeatState | undefined;
-
-  /**
-   * Workspace-level event fan-out for mutations that change daemon-wide state.
-   * Best-effort per session; closed buses silently skipped.
-   */
-  publishWorkspaceEvent(event: Omit<BridgeEvent, 'id' | 'v'>): void;
-
-  /**
-   * Union of every live session's `clientIds`. Used by workspace-level
-   * mutation routes to validate the optional `X-Qwen-Client-Id` header.
-   * Returns a snapshot — callers must not mutate.
-   */
-  knownClientIds(): ReadonlySet<string>;
 
   /**
    * Generic workspace-status query delegated through the live ACP channel.
@@ -1702,7 +1811,10 @@ export interface AcpSessionBridge {
   ): Promise<ServeSessionSupportedCommandsStatus>;
 
   /** Read the live background task snapshot for a live session. */
-  getSessionTasksStatus(sessionId: string): Promise<ServeSessionTasksStatus>;
+  getSessionTasksStatus(
+    sessionId: string,
+    opts?: { includeWorkflows?: boolean },
+  ): Promise<ServeSessionTasksStatus>;
 
   /** Read sanitized LSP server status for a live session. */
   getSessionLspStatus(sessionId: string): Promise<ServeSessionLspStatus>;
@@ -1720,8 +1832,27 @@ export interface AcpSessionBridge {
   cancelSessionTask(
     sessionId: string,
     taskId: string,
-    taskKind: 'agent' | 'shell' | 'monitor',
+    taskKind: 'agent' | 'shell' | 'monitor' | 'workflow',
+    context?: BridgeClientRequestContext,
   ): Promise<{ cancelled: boolean }>;
+
+  /** Control a run, delete history, or start a saved workflow definition. */
+  controlSessionWorkflowTask(
+    sessionId: string,
+    taskId: string,
+    action:
+      | 'pause'
+      | 'resume'
+      | 'retry'
+      | 'rerun'
+      | 'delete-history'
+      | 'run-saved',
+    context?: BridgeClientRequestContext,
+  ): Promise<{
+    changed: boolean;
+    status?: ServeSessionWorkflowTaskStatus['status'];
+    taskId?: string;
+  }>;
 
   /** Clear an active goal in a live session without cancelling the running prompt. */
   clearSessionGoal(
@@ -1791,6 +1922,7 @@ export interface AcpSessionBridge {
    */
   refreshExtensionsForAllSessions(
     data?: Omit<BridgeExtensionsChangedData, 'refreshed' | 'failed'>,
+    options?: { skillsOnly?: boolean },
   ): Promise<{
     refreshed: number;
     failed: number;
@@ -1966,7 +2098,10 @@ export interface AcpSessionBridge {
   ): Promise<boolean>;
 
   /** Delete all persisted attachments after the session itself is deleted. */
-  deleteSessionAttachments(sessionId: string): Promise<void>;
+  deleteSessionAttachments(
+    sessionId: string,
+    options?: { assertCanCommit?: () => void },
+  ): Promise<void>;
 
   /** Remove a queued or promoted mid-turn message. */
   removeMidTurnMessage(
@@ -2148,6 +2283,13 @@ export interface AcpSessionBridge {
    */
   isChannelLive(): boolean;
 
+  /**
+   * Atomic physical lifecycle snapshot. Optional only for compatibility with
+   * older injected/embedded Bridge implementations; hosts must not advertise
+   * workspace runtime control when it is absent.
+   */
+  getWorkspaceRuntimeLifecycleSnapshot?(): BridgeWorkspaceRuntimeLifecycleSnapshot;
+
   /** Number of sessions with an active prompt. */
   readonly activePromptCount: number;
 
@@ -2264,7 +2406,7 @@ export interface AcpSessionBridge {
    * cold-start latency. Fire-and-forget; failures are logged and the
    * first session falls back to lazy spawn.
    */
-  preheat(): Promise<void>;
+  preheat(options?: { keepAliveMs?: number }): Promise<void>;
 }
 
 export interface BridgeShutdownOptions {

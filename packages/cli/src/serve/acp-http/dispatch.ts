@@ -13,6 +13,7 @@ import {
   Storage,
   SessionService,
   SessionOrganizationError,
+  SessionIdCaseConflictError,
   SESSION_WRITER_RPC_CODES,
   type SessionGroupColor,
   type SessionGroupPresetColor,
@@ -39,6 +40,7 @@ import {
 } from '../acp-session-bridge.js';
 import type {
   BridgeChannelQuarantinedError,
+  BridgeTimeoutError,
   RestoreInProgressError,
   SessionRestoreTimeoutError,
 } from '../acp-session-bridge.js';
@@ -51,6 +53,7 @@ import {
 import {
   REQUESTED_SESSION_ID_META_KEY,
   type BridgeBranchedSession,
+  type BridgeRestoredSession,
   type HttpAcpBridge,
 } from '@qwen-code/acp-bridge/bridgeTypes';
 import { parseSessionSource } from '@qwen-code/acp-bridge';
@@ -58,6 +61,7 @@ import { restoreRetryAfterSeconds } from '@qwen-code/acp-bridge/sessionRestoreTi
 import {
   isReservedLiveSessionSource,
   isReservedStandaloneSessionSource,
+  readLoadableConversationSession,
   readLoadableLiveConversationMetadata,
 } from '../../runtime/live-session-source.js';
 import {
@@ -104,6 +108,10 @@ import {
   setupGithubEventData,
 } from '../routes/workspace-setup-github.js';
 import { parseWorkspaceVoiceUpdateParams } from '../routes/workspace-voice.js';
+import {
+  redactWorkflowsFromAvailableCommandsEvent,
+  redactWorkflowsFromSupportedCommands,
+} from '../workflow-session-gate.js';
 import { MAX_TRUST_REASON_LENGTH } from '../validation-limits.js';
 import {
   publicErrorMessage,
@@ -117,6 +125,10 @@ import {
 } from '../session-id-admission.js';
 import { MAX_REMEMBER_CONTENT_BYTES } from '../../runtime/workspace-memory-remember-constants.js';
 import type { DeviceFlowRegistry } from '../auth/device-flow.js';
+import {
+  StandaloneSessionServiceError,
+  type StandaloneSessionService,
+} from '../conversations/standalone-session-service.js';
 import { collectWorkspaceMemoryStatus } from '../workspace-memory.js';
 import {
   createDaemonSubagentManager,
@@ -271,6 +283,8 @@ const ALL_QWEN_VENDOR_METHODS: readonly string[] = [
   `${QWEN_METHOD_NS}session/detach`,
   `${QWEN_METHOD_NS}session/context_usage`,
   `${QWEN_METHOD_NS}session/tasks`,
+  `${QWEN_METHOD_NS}session/tasks/cancel`,
+  `${QWEN_METHOD_NS}session/tasks/workflow_action`,
   `${QWEN_METHOD_NS}session/lsp`,
   `${QWEN_METHOD_NS}session/artifacts`,
   `${QWEN_METHOD_NS}session/artifacts/add`,
@@ -343,6 +357,9 @@ const TRUSTED_WORKSPACE_METHODS = new Set<string>([
   `${QWEN_METHOD_NS}workspace/mcp/resources`,
   `${QWEN_METHOD_NS}workspace/mcp/servers/add`,
   `${QWEN_METHOD_NS}workspace/mcp/servers/remove`,
+  `${QWEN_METHOD_NS}sessions/delete`,
+  `${QWEN_METHOD_NS}sessions/archive`,
+  `${QWEN_METHOD_NS}sessions/unarchive`,
   `${QWEN_METHOD_NS}workspace/agents/list`,
   `${QWEN_METHOD_NS}workspace/agents/get`,
   `${QWEN_METHOD_NS}workspace/agents/create`,
@@ -373,6 +390,9 @@ const WORKSPACE_GENERATION_MUTATION_METHODS = new Set<string>([
   `${QWEN_METHOD_NS}file/edit`,
   `${QWEN_METHOD_NS}workspace/mcp/servers/add`,
   `${QWEN_METHOD_NS}workspace/mcp/servers/remove`,
+  `${QWEN_METHOD_NS}sessions/delete`,
+  `${QWEN_METHOD_NS}sessions/archive`,
+  `${QWEN_METHOD_NS}sessions/unarchive`,
   `${QWEN_METHOD_NS}workspace/agents/create`,
   `${QWEN_METHOD_NS}workspace/agents/update`,
   `${QWEN_METHOD_NS}workspace/agents/delete`,
@@ -665,6 +685,31 @@ export function toRpcError(err: unknown): {
       data: { errorKind: 'daemon_draining' },
     };
   }
+  if (err instanceof StandaloneSessionServiceError) {
+    const httpStatus =
+      err.code === 'invalid_request'
+        ? 400
+        : err.code === 'standalone_session_not_found'
+          ? 404
+          : err.code === 'standalone_creation_outcome_unknown' ||
+              err.code === 'standalone_creation_rolled_back'
+            ? 500
+            : 409;
+    return {
+      code:
+        httpStatus >= 500 || err.retryable
+          ? RPC.INTERNAL_ERROR
+          : RPC.INVALID_PARAMS,
+      message: err.message,
+      data: {
+        code: err.code,
+        errorKind: err.code,
+        httpStatus,
+        retryable: err.retryable,
+        ...(err.sessionId !== undefined ? { sessionId: err.sessionId } : {}),
+      },
+    };
+  }
   const writerError = sessionWriterRpcError(err);
   if (writerError) return writerError;
   if (err instanceof AcpParamError || err instanceof InvalidCursorError) {
@@ -797,6 +842,28 @@ export function toRpcError(err: unknown): {
           sessionId: restoreError.sessionId,
           action: restoreError.action,
           timeoutMs: restoreError.timeoutMs,
+        },
+      };
+    }
+    case 'BridgeTimeoutError': {
+      const timeoutError = err as BridgeTimeoutError;
+      if (timeoutError.label !== 'newSession') {
+        return {
+          code: RPC.INTERNAL_ERROR,
+          message: 'Internal error',
+          data: { errorKind: 'internal' },
+        };
+      }
+      return {
+        code: RPC.INTERNAL_ERROR,
+        message: timeoutError.message,
+        data: {
+          code: 'init_timeout',
+          errorKind: 'init_timeout',
+          httpStatus: 504,
+          retryable: true,
+          retryAfterSeconds: restoreRetryAfterSeconds(timeoutError.timeoutMs),
+          timeoutMs: timeoutError.timeoutMs,
         },
       };
     }
@@ -963,6 +1030,11 @@ export interface LiveSessionIsolation {
   isSessionActive?(sessionId: string): boolean;
 }
 
+export type LegacyStandaloneSessionRestorer = Pick<
+  StandaloneSessionService,
+  'restoreLegacyForCompatibility'
+>;
+
 interface AcpSessionRuntimeContext {
   readonly bridge: HttpAcpBridge;
   readonly sessionRuntimeBaseDir: string;
@@ -1000,6 +1072,7 @@ export class AcpDispatcher {
       bridge,
       sessionRuntimeBaseDir,
     }),
+    private readonly standaloneSessionService?: LegacyStandaloneSessionRestorer,
   ) {
     this.agentManager = createDaemonSubagentManager(boundWorkspace);
   }
@@ -1210,6 +1283,15 @@ export class AcpDispatcher {
       );
     }
     return [...new Set(sessionIds as string[])];
+  }
+
+  private parseResolveConflicts(params: Record<string, unknown>): boolean {
+    const value = params['resolveConflicts'];
+    if (value === undefined) return false;
+    if (typeof value !== 'boolean') {
+      throw new AcpParamError('`resolveConflicts` must be a boolean');
+    }
+    return value;
   }
 
   private rejectActiveLiveSessionMutation(
@@ -1840,22 +1922,77 @@ export class AcpDispatcher {
           }
           const cwd = this.parseSessionWorkspaceCwd(params);
           const sessionRuntime = this.getSessionRuntimeContext();
-          const reservation = this.requestedSessionIdAdmission.reserveRestore(
-            sessionId,
-            {
-              bridge: sessionRuntime.bridge,
-              workspaceCwd: cwd,
-              ...(sessionRuntime.workspaceId
-                ? { workspaceId: sessionRuntime.workspaceId }
-                : {}),
-            },
-          );
+          let reservation:
+            | ReturnType<RequestedSessionIdAdmission['reserveRestore']>
+            | undefined;
           try {
+            let restored: BridgeRestoredSession | undefined;
+            if (
+              this.standaloneSessionService &&
+              parseCallerSuppliedSessionId(sessionId).kind === 'valid'
+            ) {
+              const sessionService = new SessionService(cwd, {
+                runtimeBaseDir: sessionRuntime.sessionRuntimeBaseDir,
+              });
+              let storageSessionId: string | undefined;
+              try {
+                storageSessionId =
+                  await sessionService.findSessionIdIgnoringCase(sessionId);
+              } catch (error) {
+                if (
+                  !(
+                    error instanceof SessionIdCaseConflictError &&
+                    error.candidateSessionId === sessionId
+                  )
+                ) {
+                  throw error;
+                }
+              }
+              const source = storageSessionId
+                ? await readLoadableConversationSession(
+                    storageSessionId,
+                    sessionService,
+                  )
+                : undefined;
+              if (
+                source?.kind === 'standalone' &&
+                source.persistence === 'legacy'
+              ) {
+                try {
+                  restored =
+                    await this.standaloneSessionService.restoreLegacyForCompatibility(
+                      method === 'session/load' ? 'load' : 'resume',
+                      sessionId,
+                      {
+                        ...(conn.clientId ? { clientId: conn.clientId } : {}),
+                      },
+                    );
+                } catch (error) {
+                  if (
+                    !(
+                      error instanceof StandaloneSessionServiceError &&
+                      error.code === 'standalone_session_not_found'
+                    )
+                  ) {
+                    throw error;
+                  }
+                }
+              }
+            }
+            reservation = restored
+              ? undefined
+              : this.requestedSessionIdAdmission.reserveRestore(sessionId, {
+                  bridge: sessionRuntime.bridge,
+                  workspaceCwd: cwd,
+                  ...(sessionRuntime.workspaceId
+                    ? { workspaceId: sessionRuntime.workspaceId }
+                    : {}),
+                });
             // The coordinator canonicalizes lock keys (every case variant
             // of a caller id contends on one key), so the request spelling
             // alone covers the raw-spelled batch delete/archive/unarchive
             // locks (parity with the REST restore handler).
-            const restored = await this.archiveCoordinator.runSharedMany(
+            restored ??= await this.archiveCoordinator.runSharedMany(
               [sessionId],
               async () => {
                 assertGenerationOpen?.();
@@ -1908,6 +2045,16 @@ export class AcpDispatcher {
                   titleInfo.title,
                   titleInfo.source,
                 );
+                const {
+                  sourceType: _reservedSourceType,
+                  sourceId: _reservedSourceId,
+                  ...metadataWithoutSource
+                } = metadata;
+                const restoreMetadata =
+                  this.liveSessionIsolation === undefined &&
+                  isReservedStandaloneSessionSource(metadata)
+                    ? metadataWithoutSource
+                    : metadata;
                 // The private directory belongs to the live entry, which the
                 // bridge registers under the canonical id, so every other
                 // materialize/discard call site keys it the same way. Hashing
@@ -1926,14 +2073,14 @@ export class AcpDispatcher {
                         workspaceCwd: cwd,
                         clientId: conn.clientId,
                         historyReplay: 'response',
-                        ...metadata,
+                        ...restoreMetadata,
                         ...persistedTitle,
                       })
                     : await sessionRuntime.bridge.resumeSession({
                         sessionId,
                         workspaceCwd: cwd,
                         clientId: conn.clientId,
-                        ...metadata,
+                        ...restoreMetadata,
                         ...persistedTitle,
                       });
                 // Live creation and cold restore reserve this relocation before
@@ -2089,7 +2236,7 @@ export class AcpDispatcher {
             }
             return;
           } finally {
-            reservation.release();
+            reservation?.release();
           }
         }
 
@@ -2882,10 +3029,14 @@ export class AcpDispatcher {
         case `${QWEN_METHOD_NS}session/supported_commands`: {
           const sessionId = String(params['sessionId'] ?? '');
           if (!this.requireOwned(conn, sessionId, id)) return;
+          const status =
+            await this.bridge.getSessionSupportedCommandsStatus(sessionId);
           this.replyConn(
             conn,
             id,
-            await this.bridge.getSessionSupportedCommandsStatus(sessionId),
+            this.isWorkspaceTrusted()
+              ? status
+              : redactWorkflowsFromSupportedCommands(status),
           );
           return;
         }
@@ -2946,6 +3097,7 @@ export class AcpDispatcher {
                 typeof boundPr['number'] === 'number' &&
                 typeof boundPr['url'] === 'string'
               ) {
+                const boundState = boundPr['state'];
                 const persistedPrs = (
                   await upsertSessionPr(
                     service.getPrSessionPathForArchiveState(
@@ -2955,9 +3107,18 @@ export class AcpDispatcher {
                     {
                       number: boundPr['number'],
                       url: boundPr['url'],
+                      ...(boundState === 'open' ||
+                      boundState === 'merged' ||
+                      boundState === 'closed'
+                        ? { state: boundState }
+                        : {}),
                     },
                   )
-                ).map(({ number, url }) => ({ number, url }));
+                ).map(({ number, url, state }) => ({
+                  number,
+                  url,
+                  ...(state ? { state } : {}),
+                }));
                 // Reply with the authoritative persisted list, mirroring the
                 // REST metadata routes.
                 result = { ...result, prs: persistedPrs };
@@ -3606,8 +3767,109 @@ export class AcpDispatcher {
         case `${QWEN_METHOD_NS}session/tasks`: {
           const sessionId = String(params['sessionId'] ?? '');
           if (!this.requireOwned(conn, sessionId, id)) return;
-          const result = await this.bridge.getSessionTasksStatus(sessionId);
+          const result = await this.bridge.getSessionTasksStatus(sessionId, {
+            // Same fail-closed shape as the workflow control surfaces:
+            // opting in here leaks strictly more than the redacted
+            // supported-commands surface on an untrusted workspace.
+            includeWorkflows:
+              this.isWorkspaceTrusted() && params['includeWorkflows'] === true,
+          });
           this.replyConn(conn, id, result as unknown);
+          return;
+        }
+
+        case `${QWEN_METHOD_NS}session/tasks/cancel`: {
+          const sessionId = String(params['sessionId'] ?? '');
+          await this.withMutableOwned(conn, sessionId, id, async () => {
+            const taskId = String(params['taskId'] ?? '');
+            if (!taskId) {
+              if (id !== undefined) {
+                conn.sendConn(
+                  error(id, RPC.INVALID_PARAMS, '`taskId` is required'),
+                );
+              }
+              return;
+            }
+            const kind = params['kind'];
+            if (
+              kind !== 'agent' &&
+              kind !== 'shell' &&
+              kind !== 'monitor' &&
+              kind !== 'workflow'
+            ) {
+              if (id !== undefined) {
+                conn.sendConn(
+                  error(
+                    id,
+                    RPC.INVALID_PARAMS,
+                    '`kind` must be "agent", "shell", "monitor", or "workflow"',
+                  ),
+                );
+              }
+              return;
+            }
+            if (kind === 'workflow' && !this.isWorkspaceTrusted()) {
+              this.replyConn(conn, id, {
+                cancelled: false,
+                reason: 'disabled',
+              });
+              return;
+            }
+            const result = await this.bridge.cancelSessionTask(
+              sessionId,
+              taskId,
+              kind,
+              this.sessionCtx(conn, sessionId, loopback),
+            );
+            this.replyConn(conn, id, result as unknown);
+          });
+          return;
+        }
+
+        case `${QWEN_METHOD_NS}session/tasks/workflow_action`: {
+          const sessionId = String(params['sessionId'] ?? '');
+          await this.withMutableOwned(conn, sessionId, id, async () => {
+            const taskId = String(params['taskId'] ?? '');
+            if (!taskId) {
+              if (id !== undefined) {
+                conn.sendConn(
+                  error(id, RPC.INVALID_PARAMS, '`taskId` is required'),
+                );
+              }
+              return;
+            }
+            const action = params['action'];
+            if (
+              action !== 'pause' &&
+              action !== 'resume' &&
+              action !== 'retry' &&
+              action !== 'rerun' &&
+              action !== 'delete-history' &&
+              action !== 'run-saved'
+            ) {
+              if (id !== undefined) {
+                conn.sendConn(
+                  error(
+                    id,
+                    RPC.INVALID_PARAMS,
+                    '`action` must be "pause", "resume", "retry", "rerun", "delete-history", or "run-saved"',
+                  ),
+                );
+              }
+              return;
+            }
+            if (!this.isWorkspaceTrusted()) {
+              this.replyConn(conn, id, { changed: false });
+              return;
+            }
+            const result = await this.bridge.controlSessionWorkflowTask(
+              sessionId,
+              taskId,
+              action,
+              this.sessionCtx(conn, sessionId, loopback),
+            );
+            this.replyConn(conn, id, result as unknown);
+          });
           return;
         }
 
@@ -3803,6 +4065,23 @@ export class AcpDispatcher {
             }
             return;
           }
+          const rawScope = params['scope'];
+          if (
+            rawScope !== undefined &&
+            rawScope !== 'project' &&
+            rawScope !== 'user'
+          ) {
+            if (id !== undefined) {
+              conn.sendConn(
+                error(
+                  id,
+                  RPC.INVALID_PARAMS,
+                  '`scope` must be "project", "user", or omitted',
+                ),
+              );
+            }
+            return;
+          }
           try {
             const available =
               await this.bridge.isWorkspaceMemoryRememberAvailable();
@@ -3826,6 +4105,7 @@ export class AcpDispatcher {
             const task = this.workspaceRememberLane.enqueue({
               content: content.trim(),
               contextMode: rawContextMode,
+              ...(rawScope ? { scope: rawScope } : {}),
               ...(conn.clientId ? { originatorClientId: conn.clientId } : {}),
               ...(assertGenerationOpen ? { assertGenerationOpen } : {}),
             });
@@ -3906,6 +4186,23 @@ export class AcpDispatcher {
             }
             return;
           }
+          const rawScope = params['scope'];
+          if (
+            rawScope !== undefined &&
+            rawScope !== 'project' &&
+            rawScope !== 'user'
+          ) {
+            if (id !== undefined) {
+              conn.sendConn(
+                error(
+                  id,
+                  RPC.INVALID_PARAMS,
+                  '`scope` must be "project", "user", or omitted',
+                ),
+              );
+            }
+            return;
+          }
           try {
             const available =
               await this.bridge.isWorkspaceMemoryRememberAvailable();
@@ -3928,6 +4225,7 @@ export class AcpDispatcher {
             }
             const task = this.workspaceRememberLane.enqueueForget({
               query: trimmedQuery,
+              ...(rawScope ? { scope: rawScope } : {}),
               ...(conn.clientId ? { originatorClientId: conn.clientId } : {}),
               ...(assertGenerationOpen ? { assertGenerationOpen } : {}),
             });
@@ -4643,6 +4941,7 @@ export class AcpDispatcher {
                 service: svc,
                 bridge: this.bridge,
                 coordinator: this.archiveCoordinator,
+                assertCanMutate: assertGenerationOpen,
                 onError: ({ phase, sessionId, error }) => {
                   const safeSessionId = logSafe(sessionId.slice(0, 8));
                   const safeMessage = logSafe(error);
@@ -4652,12 +4951,14 @@ export class AcpDispatcher {
                 },
               }),
           );
+          assertGenerationOpen?.();
           this.replyConn(conn, id, result as unknown);
           return;
         }
 
         case `${QWEN_METHOD_NS}sessions/archive`: {
           const ids = this.parseSessionIds(params);
+          const resolveConflicts = this.parseResolveConflicts(params);
           if (this.rejectActiveLiveSessionMutation(conn, id, ids)) return;
           const svc = new SessionService(this.boundWorkspace, {
             onWarning: logSessionArchiveWarning,
@@ -4670,11 +4971,15 @@ export class AcpDispatcher {
                 service: svc,
                 bridge: this.bridge,
                 coordinator: this.archiveCoordinator,
+                resolveConflicts,
+                assertCanMutate: assertGenerationOpen,
               }),
           );
+          assertGenerationOpen?.();
           this.replyConn(conn, id, {
             archived: result.archived,
             alreadyArchived: result.alreadyArchived,
+            resolvedConflicts: result.resolvedConflicts,
             notFound: result.notFound,
             errors: this.serializeSessionErrors(result.errors),
           } as unknown);
@@ -4683,6 +4988,7 @@ export class AcpDispatcher {
 
         case `${QWEN_METHOD_NS}sessions/unarchive`: {
           const ids = this.parseSessionIds(params);
+          const resolveConflicts = this.parseResolveConflicts(params);
           const svc = new SessionService(this.boundWorkspace, {
             onWarning: logSessionArchiveWarning,
           });
@@ -4693,11 +4999,15 @@ export class AcpDispatcher {
                 sessionIds: ids,
                 service: svc,
                 coordinator: this.archiveCoordinator,
+                resolveConflicts,
+                assertCanMutate: assertGenerationOpen,
               }),
           );
+          assertGenerationOpen?.();
           this.replyConn(conn, id, {
             unarchived: result.unarchived,
             alreadyActive: result.alreadyActive,
+            resolvedConflicts: result.resolvedConflicts,
             notFound: result.notFound,
             errors: this.serializeSessionErrors(result.errors),
           } as unknown);
@@ -5224,9 +5534,12 @@ export class AcpDispatcher {
         // `event.data` is the ACP `SessionNotification` (params shape).
         // `event.id` is the bus cursor → SSE `id:` line for `Last-Event-ID`
         // resume (the content frames §1.8 recovers all flow through here).
+        const shaped = this.isWorkspaceTrusted()
+          ? event
+          : redactWorkflowsFromAvailableCommandsEvent(event);
         conn.sendSession(
           sessionId,
-          notification('session/update', event.data),
+          notification('session/update', shaped.data),
           event.id,
         );
         return;
