@@ -11260,15 +11260,20 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         // identical-text case is the subset this guard originally covered
         // (#8977). Exception: records persisted before provenance tracking
         // stored the derived ⏰ title as `manual`; an incoming `auto` rename
-        // for those is a migration to the correct provenance, not a
-        // downgrade of a user choice.
+        // with CHANGED text for those is a migration to the correct
+        // provenance (the task prompt moved on), not a downgrade of a user
+        // choice. An identical-text re-rename stays blocked: the user may
+        // have deliberately picked a ⏰-style name.
         const legacyDerivedScheduledTaskTitle =
           typeof entry.displayName === 'string' &&
           entry.displayName.startsWith('⏰ ');
         const manualToAutoDowngrade =
           entry.titleSource === 'manual' &&
           nextTitleSource === 'auto' &&
-          !legacyDerivedScheduledTaskTitle;
+          !(
+            legacyDerivedScheduledTaskTitle &&
+            entry.displayName !== nextDisplayName
+          );
         if (
           (entry.displayName !== nextDisplayName ||
             entry.titleSource !== nextTitleSource) &&
