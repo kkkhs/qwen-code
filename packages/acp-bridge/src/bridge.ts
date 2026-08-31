@@ -1370,7 +1370,10 @@ function writeServeDebugLine(message: string): void {
   writeStderrLine(`qwen serve debug: ${message}`);
 }
 
-const MAX_DISPLAY_NAME_LENGTH = 256;
+// The child silently truncates persisted session titles at 200 characters
+// (packages/cli/src/serve/routes/session.ts), so validate at the same bound:
+// accepting more would acknowledge a rename the child cannot persist.
+const MAX_DISPLAY_NAME_LENGTH = 200;
 
 /**
  * Upper bound on how many prompt content blocks the bridge echoes per
@@ -11255,9 +11258,17 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         // text-agnostic block a session the user renamed to something else
         // loses its manual name in memory and on disk within one tick. The
         // identical-text case is the subset this guard originally covered
-        // (#8977).
+        // (#8977). Exception: records persisted before provenance tracking
+        // stored the derived ⏰ title as `manual`; an incoming `auto` rename
+        // for those is a migration to the correct provenance, not a
+        // downgrade of a user choice.
+        const legacyDerivedScheduledTaskTitle =
+          typeof entry.displayName === 'string' &&
+          entry.displayName.startsWith('⏰ ');
         const manualToAutoDowngrade =
-          entry.titleSource === 'manual' && nextTitleSource === 'auto';
+          entry.titleSource === 'manual' &&
+          nextTitleSource === 'auto' &&
+          !legacyDerivedScheduledTaskTitle;
         if (
           (entry.displayName !== nextDisplayName ||
             entry.titleSource !== nextTitleSource) &&
