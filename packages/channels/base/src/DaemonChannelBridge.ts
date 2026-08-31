@@ -37,6 +37,8 @@ export interface DaemonChannelEvent {
 export interface DaemonChannelSessionClient {
   readonly sessionId: string;
   readonly workspaceCwd: string;
+  readonly worktree?: { slug: string; path: string; branch: string };
+  readonly worktreeState?: 'persisted-v1';
   readonly lastEventId?: number;
   prompt(
     req: {
@@ -78,6 +80,7 @@ export interface DaemonChannelSessionFactoryRequest {
   approvalMode?: string;
   /** Channel instance name stamped as daemon `sourceId`. */
   sourceId?: string;
+  worktree?: Record<string, never>;
 }
 
 export type DaemonChannelSessionFactory = (
@@ -106,6 +109,8 @@ export interface DaemonChannelBridgeOptions {
    * instead, as before the upload path existed.
    */
   sessionAttachments?: boolean;
+  /** Daemon guarantees durable worktree create/restore attestation. */
+  sessionWorktreePersistence?: boolean;
 }
 
 export interface DaemonPermissionRequestEvent {
@@ -368,6 +373,10 @@ export class DaemonChannelBridge
         sessionId: session.sessionId,
         workspaceCwd: session.workspaceCwd,
         hasActivePrompt: this.activePrompts.has(session.sessionId),
+        ...(session.worktree ? { worktree: { ...session.worktree } } : {}),
+        ...(session.worktreeState
+          ? { worktreeState: session.worktreeState }
+          : {}),
       });
     }
     return result;
@@ -382,6 +391,11 @@ export class DaemonChannelBridge
     options?: ChannelAgentBridgeSessionOptions,
     bindingToken?: object,
   ): Promise<string> {
+    if (options?.worktree && !this.options.sessionWorktreePersistence) {
+      throw new Error(
+        'The daemon does not support durable Channel worktree sessions.',
+      );
+    }
     const lifecycleGeneration = this.lifecycleGeneration;
     const session = await this.options.sessionFactory({
       workspaceCwd: cwd || this.options.cwd,
@@ -389,6 +403,7 @@ export class DaemonChannelBridge
       sessionScope: this.options.sessionScope ?? 'thread',
       ...(options?.approvalMode ? { approvalMode: options.approvalMode } : {}),
       ...(options?.sourceId ? { sourceId: options.sourceId } : {}),
+      ...(options?.worktree ? { worktree: options.worktree } : {}),
     });
     if (lifecycleGeneration !== this.lifecycleGeneration) {
       await this.rejectStaleSession(session);
