@@ -133,6 +133,7 @@ import type {
   PromptResult,
   SetModelResult,
   SetSessionLanguageResult,
+  SetUserLanguageResult,
   SessionMetadataResult,
   DaemonApprovalMode,
   DaemonApprovalModeResult,
@@ -1377,14 +1378,22 @@ export class DaemonClient {
     );
   }
 
-  async workspaceGitPull(opts?: {
-    rebase?: boolean;
-    fetchOnly?: boolean;
-  }): Promise<DaemonGitPullResult> {
+  async workspaceGitPull(
+    opts?: {
+      rebase?: boolean;
+      fetchOnly?: boolean;
+      stash?: boolean;
+      force?: boolean;
+    },
+    // The stash/force flows chain several git commands server-side, each
+    // with its own budget, so callers can outsize the client's default
+    // fetch timeout instead of aborting mid-flow while the daemon runs on.
+    timeoutMs?: number,
+  ): Promise<DaemonGitPullResult> {
     return await this.jsonRequest<DaemonGitPullResult>(
       '/workspace/git/pull',
       'POST /workspace/git/pull',
-      { method: 'POST', body: opts ?? {}, mode: 'rest' },
+      { method: 'POST', body: opts ?? {}, mode: 'rest', timeoutMs },
     );
   }
 
@@ -5066,6 +5075,30 @@ export class DaemonClient {
   }
 
   /**
+   * Sessionless user-level language sync (`POST /language`). Succeeds with
+   * zero sessions, so hosts can switch language before creating one.
+   * Pre-flight `caps.features.includes('user_language_sync')` — daemons that
+   * predate the route or were built without settings persistence 404.
+   */
+  async setUserLanguage(
+    language: string,
+    opts?: { syncOutputLanguage?: boolean; clientId?: string },
+  ): Promise<SetUserLanguageResult> {
+    return await this.jsonRequest<SetUserLanguageResult>(
+      '/language',
+      'POST /language',
+      {
+        method: 'POST',
+        body: {
+          language,
+          syncOutputLanguage: opts?.syncOutputLanguage ?? false,
+        },
+        clientId: opts?.clientId,
+      },
+    );
+  }
+
+  /**
    * Send a prompt to the agent. Supports both blocking (legacy 200)
    * and non-blocking (202 + SSE `turn_complete`) daemon responses.
    *
@@ -5811,7 +5844,7 @@ export class DaemonClient {
     metadata: {
       displayName?: string;
       titleSource?: 'manual' | 'auto';
-      pr?: DaemonSessionPrInfo;
+      pr?: Omit<DaemonSessionPrInfo, 'issues'>;
     },
     clientId?: string,
   ): Promise<SessionMetadataResult> {
@@ -6310,8 +6343,14 @@ export class WorkspaceDaemonClient {
     opts?: {
       rebase?: boolean;
       fetchOnly?: boolean;
+      stash?: boolean;
+      force?: boolean;
     },
     cwd?: string,
+    // The stash/force flows chain several git commands server-side, each
+    // with its own budget, so callers can outsize the client's default
+    // fetch timeout instead of aborting mid-flow while the daemon runs on.
+    timeoutMs?: number,
   ): Promise<DaemonGitPullResult> {
     const suffix =
       cwd != null ? `/git/pull?cwd=${urlEncode(cwd)}` : '/git/pull';
@@ -6319,7 +6358,7 @@ export class WorkspaceDaemonClient {
       this.workspaceSelector,
       suffix,
       'POST /workspaces/:workspace/git/pull',
-      { method: 'POST', body: opts ?? {}, mode: 'rest' },
+      { method: 'POST', body: opts ?? {}, mode: 'rest', timeoutMs },
     );
   }
 
@@ -6626,7 +6665,7 @@ export class WorkspaceDaemonClient {
     metadata: {
       displayName?: string;
       titleSource?: 'manual' | 'auto';
-      pr?: DaemonSessionPrInfo;
+      pr?: Omit<DaemonSessionPrInfo, 'issues'>;
     },
     clientId?: string,
   ): Promise<SessionMetadataResult> {
