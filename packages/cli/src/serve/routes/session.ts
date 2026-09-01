@@ -3915,13 +3915,20 @@ export function registerSessionRoutes(
               }
               const sidecar = sidecarResult.session;
               const realWorkspace = fs.realpathSync(workspaceCwd);
-              if (
-                sidecar.workspaceCwd !== undefined &&
-                fs.realpathSync(sidecar.workspaceCwd) !== realWorkspace
-              ) {
-                throw new Error(
-                  'Worktree sidecar belongs to another workspace',
-                );
+              if (sidecar.workspaceCwd !== undefined) {
+                let realSidecarWorkspace: string;
+                try {
+                  realSidecarWorkspace = fs.realpathSync(sidecar.workspaceCwd);
+                } catch {
+                  throw new Error(
+                    'Worktree sidecar workspace is missing or inaccessible',
+                  );
+                }
+                if (realSidecarWorkspace !== realWorkspace) {
+                  throw new Error(
+                    'Worktree sidecar belongs to another workspace',
+                  );
+                }
               }
               const workspaceRoots = [realWorkspace];
               let repoTop: string | null = null;
@@ -3935,7 +3942,14 @@ export function registerSessionRoutes(
               if (repoTop && repoTop !== realWorkspace) {
                 workspaceRoots.push(fs.realpathSync(repoTop));
               }
-              const realOriginalCwd = fs.realpathSync(sidecar.originalCwd);
+              let realOriginalCwd: string;
+              try {
+                realOriginalCwd = fs.realpathSync(sidecar.originalCwd);
+              } catch {
+                throw new Error(
+                  'Worktree sidecar workspace is missing or inaccessible',
+                );
+              }
               if (!workspaceRoots.includes(realOriginalCwd)) {
                 throw new Error(
                   'Worktree sidecar belongs to another workspace',
@@ -3978,10 +3992,14 @@ export function registerSessionRoutes(
                 path: realTarget,
                 branch: sidecar.worktreeBranch,
               };
-              const hasLivePrompt =
+              const hasUnlocatedRestoredPrompt =
                 session.hasActivePrompt &&
-                (session.attached || session.currentCwd !== undefined);
-              if (hasLivePrompt) {
+                !session.attached &&
+                session.currentCwd === undefined;
+              if (hasUnlocatedRestoredPrompt) {
+                runtime.bridge.setSessionWorktree(sessionId, worktree);
+                session.worktree = worktree;
+              } else if (session.hasActivePrompt) {
                 if (
                   sidecar.workspaceCwd !== undefined &&
                   session.currentCwd !== realTarget
@@ -4001,10 +4019,12 @@ export function registerSessionRoutes(
                 }
                 session.currentCwd = changed.newCwd;
               }
-              runtime.bridge.setSessionWorktree(sessionId, worktree);
-              assertRuntimeGenerationOpen?.();
-              session.worktree = worktree;
-              session.worktreeState = 'persisted-v1';
+              if (!hasUnlocatedRestoredPrompt) {
+                runtime.bridge.setSessionWorktree(sessionId, worktree);
+                assertRuntimeGenerationOpen?.();
+                session.worktree = worktree;
+                session.worktreeState = 'persisted-v1';
+              }
             } catch (restoreErr) {
               daemonLog?.warn('worktree integrity validation failed', {
                 sessionId: session.sessionId,
@@ -4022,7 +4042,12 @@ export function registerSessionRoutes(
           await cleanupRestoredSession();
           return;
         }
-        assertRuntimeGenerationOpen?.();
+        try {
+          assertRuntimeGenerationOpen?.();
+        } catch (error) {
+          await cleanupRestoredSession();
+          throw error;
+        }
         if (
           deferRestoreAskUserQuestionPrompt &&
           runtime.bridge.fireDeferredRestoreAskUserQuestionPrompt?.(
