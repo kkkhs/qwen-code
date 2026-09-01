@@ -224,6 +224,9 @@ const mockWt = vi.hoisted(() => ({
   readSidecar: undefined as
     | ((...args: unknown[]) => Promise<unknown>)
     | undefined,
+  readSidecarStrict: undefined as
+    | ((...args: unknown[]) => Promise<unknown>)
+    | undefined,
   writeSidecar: undefined as
     | ((...args: unknown[]) => Promise<unknown>)
     | undefined,
@@ -269,6 +272,9 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
     readWorktreeSession: (...args: unknown[]) =>
       mockWt.readSidecar ? mockWt.readSidecar(...args) : Promise.resolve(null),
     readWorktreeSessionStrict: async (...args: unknown[]) => {
+      if (mockWt.readSidecarStrict) {
+        return mockWt.readSidecarStrict(...args);
+      }
       if (!mockWt.readSidecar) {
         return { state: 'missing' };
       }
@@ -892,13 +898,21 @@ interface FakeBridgeOpts {
   spawnImpl?: (req: BridgeSpawnRequest) => Promise<BridgeSession>;
   changeSessionCwdImpl?: (
     sessionId: string,
-    req: { path: string },
+    req: Parameters<AcpSessionBridge['changeSessionCwd']>[1],
   ) => Promise<{
     sessionId: string;
     previousCwd: string;
     newCwd: string;
     warnings: string[];
   }>;
+  fireDeferredRestoreAskUserQuestionPromptImpl?: (
+    sessionId: string,
+    clientId: string | undefined,
+  ) => boolean;
+  discardDeferredRestoreAskUserQuestionPromptImpl?: (
+    sessionId: string,
+    clientId: string | undefined,
+  ) => void;
   killImpl?: (
     sessionId: string,
     opts?: { requireZeroAttaches?: boolean },
@@ -1193,10 +1207,22 @@ interface FakeBridge extends AcpSessionBridge {
     opts?: { requireZeroAttaches?: boolean };
   }>;
   detachCalls: Array<{ sessionId: string; clientId?: string }>;
-  changeSessionCwdCalls: Array<{ sessionId: string; path: string }>;
+  changeSessionCwdCalls: Array<{
+    sessionId: string;
+    path: string;
+    allowedRoots?: string[];
+  }>;
   setSessionWorktreeCalls: Array<{
     sessionId: string;
     worktree: { slug: string; path: string; branch: string };
+  }>;
+  fireDeferredRestoreAskUserQuestionPromptCalls: Array<{
+    sessionId: string;
+    clientId: string | undefined;
+  }>;
+  discardDeferredRestoreAskUserQuestionPromptCalls: Array<{
+    sessionId: string;
+    clientId: string | undefined;
   }>;
   enqueueMidTurnCalls: Array<{
     sessionId: string;
@@ -1424,11 +1450,19 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
   const catalogGeneration = `server-fake-catalog-gen-${Math.random()
     .toString(36)
     .slice(2)}`;
-  const changeSessionCwdCalls: Array<{ sessionId: string; path: string }> = [];
+  const changeSessionCwdCalls: FakeBridge['changeSessionCwdCalls'] = [];
   const sessionCwds = new Map<string, string>();
   const setSessionWorktreeCalls: Array<{
     sessionId: string;
     worktree: { slug: string; path: string; branch: string };
+  }> = [];
+  const fireDeferredRestoreAskUserQuestionPromptCalls: Array<{
+    sessionId: string;
+    clientId: string | undefined;
+  }> = [];
+  const discardDeferredRestoreAskUserQuestionPromptCalls: Array<{
+    sessionId: string;
+    clientId: string | undefined;
   }> = [];
   const enqueueMidTurnCalls: FakeBridge['enqueueMidTurnCalls'] = [];
   const sessionAttachments = new Map<
@@ -2092,6 +2126,8 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
     detachCalls,
     changeSessionCwdCalls,
     setSessionWorktreeCalls,
+    fireDeferredRestoreAskUserQuestionPromptCalls,
+    discardDeferredRestoreAskUserQuestionPromptCalls,
     enqueueMidTurnCalls,
     removeMidTurnCalls,
     getMidTurnMessagesCalls,
@@ -2708,7 +2744,11 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
       });
     },
     async changeSessionCwd(sessionId, req) {
-      changeSessionCwdCalls.push({ sessionId, path: req.path });
+      changeSessionCwdCalls.push({
+        sessionId,
+        path: req.path,
+        ...(req.allowedRoots ? { allowedRoots: [...req.allowedRoots] } : {}),
+      });
       if (opts.changeSessionCwdImpl) {
         const result = await opts.changeSessionCwdImpl(sessionId, req);
         sessionCwds.set(sessionId, result.newCwd);
@@ -2729,6 +2769,28 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
     async releaseManagedConversationBinding() {},
     setSessionWorktree(sessionId, worktree) {
       setSessionWorktreeCalls.push({ sessionId, worktree });
+    },
+    fireDeferredRestoreAskUserQuestionPrompt(sessionId, clientId) {
+      fireDeferredRestoreAskUserQuestionPromptCalls.push({
+        sessionId,
+        clientId,
+      });
+      return (
+        opts.fireDeferredRestoreAskUserQuestionPromptImpl?.(
+          sessionId,
+          clientId,
+        ) ?? false
+      );
+    },
+    discardDeferredRestoreAskUserQuestionPrompt(sessionId, clientId) {
+      discardDeferredRestoreAskUserQuestionPromptCalls.push({
+        sessionId,
+        clientId,
+      });
+      opts.discardDeferredRestoreAskUserQuestionPromptImpl?.(
+        sessionId,
+        clientId,
+      );
     },
     isChannelLive() {
       return false;
@@ -12674,6 +12736,7 @@ describe('createServeApp', () => {
 
     it('creates a worktree session and relocates via changeSessionCwd', async () => {
       const bridge = fakeBridge();
+      const createMarker = vi.fn().mockResolvedValue(undefined);
       const writeSidecar = vi.fn().mockResolvedValue(undefined);
       const app = createServeApp(
         { ...baseOpts, workspace: WS_BOUND },
@@ -12693,6 +12756,7 @@ describe('createServeApp', () => {
         createUserWorktree: mockCreate,
       });
       mockWt.realpath = (p) => p;
+      mockWt.createMarker = createMarker;
       mockWt.writeSidecar = writeSidecar;
 
       try {
@@ -12714,11 +12778,24 @@ describe('createServeApp', () => {
           '/work/a/.qwen/worktrees/my-task',
         );
         expect(mockCreate).toHaveBeenCalledWith('my-task', 'main');
+        expect(createMarker).toHaveBeenCalledWith(
+          '/work/a/.qwen/worktrees/my-task',
+          'fake-0',
+        );
         expect(writeSidecar).toHaveBeenCalledWith(
-          expect.any(String),
-          expect.objectContaining({ workspaceCwd: WS_BOUND }),
+          expect.stringMatching(/fake-0\.worktree\.json$/),
+          {
+            slug: 'my-task',
+            worktreePath: '/work/a/.qwen/worktrees/my-task',
+            worktreeBranch: 'worktree-my-task',
+            originalCwd: WS_BOUND,
+            workspaceCwd: WS_BOUND,
+            originalBranch: '',
+            originalHeadCommit: '',
+          },
         );
       } finally {
+        mockWt.createMarker = undefined;
         mockWt.writeSidecar = undefined;
         mockWt.realpath = undefined;
         mockWt.impl = undefined;
@@ -13907,7 +13984,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'persisted-page',
           workspaceCwd: WS_BOUND,
-          suppressWorktreeContextRestore: true,
           historyReplay: 'response',
           historyPageSize: 100,
         },
@@ -13932,7 +14008,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'persisted-summary',
           workspaceCwd: WS_BOUND,
-          suppressWorktreeContextRestore: true,
           historyReplay: 'response',
           liveReplayMode: 'summary',
         },
@@ -13995,7 +14070,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'persisted-summary-resume',
           workspaceCwd: WS_BOUND,
-          suppressWorktreeContextRestore: true,
         },
       ]);
     });
@@ -14054,7 +14128,6 @@ describe('createServeApp', () => {
           {
             sessionId: 'persisted-1',
             workspaceCwd: WS_BOUND,
-            suppressWorktreeContextRestore: true,
             ...(action === 'load' ? { historyReplay: 'response' } : {}),
           },
         ]);
@@ -14095,6 +14168,76 @@ describe('createServeApp', () => {
         }
       },
     );
+
+    it.each(['load', 'resume'] as const)(
+      'suppresses model worktree context only for Channel-owned %s restores',
+      async (action) => {
+        const bridge = fakeBridge();
+        const readCreationMetadata = vi
+          .spyOn(SessionService.prototype, 'readCreationMetadata')
+          .mockResolvedValue({ sourceType: 'channel', sourceId: 'telegram' });
+        const app = createServeApp(
+          { ...baseOpts, workspace: WS_BOUND },
+          undefined,
+          { bridge },
+        );
+
+        try {
+          const res = await request(app)
+            .post(`/session/channel-session/${action}`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`)
+            .send({});
+
+          expect(res.status).toBe(200);
+          const calls =
+            action === 'load' ? bridge.loadCalls : bridge.resumeCalls;
+          expect(calls).toEqual([
+            {
+              sessionId: 'channel-session',
+              workspaceCwd: WS_BOUND,
+              suppressWorktreeContextRestore: true,
+              deferRestoreAskUserQuestionPrompt: true,
+              sourceType: 'channel',
+              sourceId: 'telegram',
+              ...(action === 'load' ? { historyReplay: 'response' } : {}),
+            },
+          ]);
+        } finally {
+          readCreationMetadata.mockRestore();
+        }
+      },
+    );
+
+    it('does not defer a Channel restore on a bridge without deferred admission', async () => {
+      const bridge = fakeBridge();
+      delete (bridge as Partial<AcpSessionBridge>)
+        .fireDeferredRestoreAskUserQuestionPrompt;
+      const readCreationMetadata = vi
+        .spyOn(SessionService.prototype, 'readCreationMetadata')
+        .mockResolvedValue({ sourceType: 'channel', sourceId: 'telegram' });
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+
+      try {
+        const res = await request(app)
+          .post('/session/channel-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({});
+
+        expect(res.status).toBe(200);
+        expect(bridge.loadCalls[0]).toMatchObject({
+          suppressWorktreeContextRestore: true,
+        });
+        expect(bridge.loadCalls[0]).not.toHaveProperty(
+          'deferRestoreAskUserQuestionPrompt',
+        );
+      } finally {
+        readCreationMetadata.mockRestore();
+      }
+    });
 
     it.each(['load', 'resume'] as const)(
       'restores mixed-case reserved-source transcripts on ordinary workspace runtimes (%s)',
@@ -14283,7 +14426,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'persisted-approval',
           workspaceCwd: WS_BOUND,
-          suppressWorktreeContextRestore: true,
           historyReplay: 'response',
         },
       ]);
@@ -14315,7 +14457,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'persisted-2',
           workspaceCwd: WS_BOUND,
-          suppressWorktreeContextRestore: true,
           historyReplay: 'response',
         },
       ]);
@@ -14352,7 +14493,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'persisted-partial',
           workspaceCwd: realpathSync.native(process.cwd()),
-          suppressWorktreeContextRestore: true,
           historyReplay: 'response',
         },
       ]);
@@ -14607,7 +14747,6 @@ describe('createServeApp', () => {
           {
             sessionId: 'persisted-1',
             workspaceCwd: realpathSync.native(process.cwd()),
-            suppressWorktreeContextRestore: true,
             ...(action === 'load' ? { historyReplay: 'response' } : {}),
             clientId: 'client-1',
           },
@@ -14898,7 +15037,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'persisted-secondary',
           workspaceCwd: WS_DIFFERENT,
-          suppressWorktreeContextRestore: true,
           historyReplay: 'response',
         },
       ]);
@@ -15043,7 +15181,6 @@ describe('createServeApp', () => {
         {
           sessionId: 'concurrent-restore',
           workspaceCwd: WS_DIFFERENT,
-          suppressWorktreeContextRestore: true,
           historyReplay: 'response',
         },
       ]);
@@ -15360,11 +15497,201 @@ describe('createServeApp', () => {
         expect(res.status).toBe(200);
         expect(res.body.worktree).toMatchObject({ path: worktreePath });
         expect(res.body.worktreeState).toBe('persisted-v1');
+        expect(bridge.changeSessionCwdCalls[0]?.allowedRoots).toEqual([
+          `${WS_BOUND}/.qwen/worktrees`,
+          `${repoRoot}/.qwen/worktrees`,
+        ]);
       } finally {
         mockWt.readSidecar = undefined;
         mockWt.readMarker = undefined;
         mockWt.realpath = undefined;
         mockWt.impl = undefined;
+      }
+    });
+
+    it('keeps an active legacy tool worktree load compatible', async () => {
+      const worktreePath = `${WS_BOUND}/.qwen/worktrees/my-task`;
+      const bridge = fakeBridge({
+        loadImpl: async (req) => ({
+          sessionId: req.sessionId,
+          workspaceCwd: req.workspaceCwd,
+          currentCwd: WS_BOUND,
+          attached: true,
+          clientId: 'attached-client',
+          state: {},
+          hasActivePrompt: true,
+        }),
+      });
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      mockWt.realpath = (p) => p;
+      mockWt.readMarker = () =>
+        Promise.resolve({ state: 'valid', sessionId: 'wt-session' });
+      mockWt.readSidecar = () =>
+        Promise.resolve({
+          slug: 'my-task',
+          worktreePath,
+          worktreeBranch: 'worktree-my-task',
+          originalCwd: WS_BOUND,
+          originalBranch: 'main',
+          originalHeadCommit: 'abc123',
+        });
+
+      try {
+        const res = await request(app)
+          .post('/session/wt-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND });
+
+        expect(res.status).toBe(200);
+        expect(res.body.worktreeState).toBe('persisted-v1');
+        expect(bridge.changeSessionCwdCalls).toHaveLength(0);
+        expect(bridge.detachCalls).toHaveLength(0);
+        expect(bridge.setSessionWorktreeCalls).toHaveLength(1);
+      } finally {
+        mockWt.readSidecar = undefined;
+        mockWt.readMarker = undefined;
+        mockWt.realpath = undefined;
+      }
+    });
+
+    it('fails closed when an active route-owned session is outside its worktree', async () => {
+      const worktreePath = `${WS_BOUND}/.qwen/worktrees/my-task`;
+      const bridge = fakeBridge({
+        loadImpl: async (req) => ({
+          sessionId: req.sessionId,
+          workspaceCwd: req.workspaceCwd,
+          currentCwd: WS_BOUND,
+          attached: true,
+          clientId: 'attached-client',
+          state: {},
+          hasActivePrompt: true,
+        }),
+      });
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      const readCreationMetadata = vi
+        .spyOn(SessionService.prototype, 'readCreationMetadata')
+        .mockResolvedValue({ sourceType: 'channel', sourceId: 'telegram' });
+      mockWt.realpath = (p) => p;
+      mockWt.readMarker = () =>
+        Promise.resolve({ state: 'valid', sessionId: 'wt-session' });
+      mockWt.readSidecar = () =>
+        Promise.resolve({
+          slug: 'my-task',
+          worktreePath,
+          worktreeBranch: 'worktree-my-task',
+          originalCwd: WS_BOUND,
+          workspaceCwd: WS_BOUND,
+          originalBranch: 'main',
+          originalHeadCommit: 'abc123',
+        });
+
+      try {
+        const res = await request(app)
+          .post('/session/wt-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND });
+
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('Active session is outside its worktree');
+        expect(bridge.changeSessionCwdCalls).toHaveLength(0);
+        expect(bridge.setSessionWorktreeCalls).toHaveLength(0);
+        expect(bridge.detachCalls).toEqual([
+          { sessionId: 'wt-session', clientId: 'attached-client' },
+        ]);
+        expect(bridge.discardDeferredRestoreAskUserQuestionPromptCalls).toEqual(
+          [
+            {
+              sessionId: 'wt-session',
+              clientId: 'attached-client',
+            },
+          ],
+        );
+      } finally {
+        mockWt.readSidecar = undefined;
+        mockWt.readMarker = undefined;
+        mockWt.realpath = undefined;
+        readCreationMetadata.mockRestore();
+      }
+    });
+
+    it('relocates a cold Channel restore before firing its deferred question', async () => {
+      const worktreePath = `${WS_BOUND}/.qwen/worktrees/my-task`;
+      let relocated = false;
+      const bridge = fakeBridge({
+        loadImpl: async (req) => ({
+          sessionId: req.sessionId,
+          workspaceCwd: req.workspaceCwd,
+          attached: false,
+          clientId: 'client-load',
+          state: {},
+          hasActivePrompt: false,
+        }),
+        changeSessionCwdImpl: async (sessionId, req) => {
+          relocated = true;
+          return {
+            sessionId,
+            previousCwd: WS_BOUND,
+            newCwd: req.path,
+            warnings: [],
+          };
+        },
+        fireDeferredRestoreAskUserQuestionPromptImpl: () => {
+          expect(relocated).toBe(true);
+          return true;
+        },
+      });
+      const readCreationMetadata = vi
+        .spyOn(SessionService.prototype, 'readCreationMetadata')
+        .mockResolvedValue({ sourceType: 'channel', sourceId: 'telegram' });
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      mockWt.realpath = (p) => p;
+      mockWt.readMarker = () =>
+        Promise.resolve({ state: 'valid', sessionId: 'wt-session' });
+      mockWt.readSidecar = () =>
+        Promise.resolve({
+          slug: 'my-task',
+          worktreePath,
+          worktreeBranch: 'worktree-my-task',
+          originalCwd: WS_BOUND,
+          workspaceCwd: WS_BOUND,
+          originalBranch: 'main',
+          originalHeadCommit: 'abc123',
+        });
+
+      try {
+        const res = await request(app)
+          .post('/session/wt-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND });
+
+        expect(res.status).toBe(200);
+        expect(res.body.hasActivePrompt).toBe(true);
+        expect(bridge.changeSessionCwdCalls).toHaveLength(1);
+        expect(bridge.fireDeferredRestoreAskUserQuestionPromptCalls).toEqual([
+          { sessionId: 'wt-session', clientId: 'client-load' },
+        ]);
+        expect(bridge.killCalls).toHaveLength(0);
+        expect(bridge.loadCalls[0]).toMatchObject({
+          suppressWorktreeContextRestore: true,
+          deferRestoreAskUserQuestionPrompt: true,
+        });
+      } finally {
+        mockWt.readSidecar = undefined;
+        mockWt.readMarker = undefined;
+        mockWt.realpath = undefined;
+        readCreationMetadata.mockRestore();
       }
     });
 
@@ -15376,6 +15703,8 @@ describe('createServeApp', () => {
         { bridge },
       );
       mockWt.realpath = (p) => p;
+      mockWt.readMarker = () =>
+        Promise.resolve({ state: 'valid', sessionId: 'wt-session' });
       mockWt.readSidecar = () =>
         Promise.resolve({
           slug: 'my-task',
@@ -15398,6 +15727,43 @@ describe('createServeApp', () => {
         expect(bridge.setSessionWorktreeCalls).toHaveLength(0);
       } finally {
         mockWt.readSidecar = undefined;
+        mockWt.readMarker = undefined;
+        mockWt.realpath = undefined;
+      }
+    });
+
+    it('fails closed when a legacy sidecar names a foreign original workspace', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      mockWt.realpath = (p) => p;
+      mockWt.readMarker = () =>
+        Promise.resolve({ state: 'valid', sessionId: 'wt-session' });
+      mockWt.readSidecar = () =>
+        Promise.resolve({
+          slug: 'my-task',
+          worktreePath: `${WS_BOUND}/.qwen/worktrees/my-task`,
+          worktreeBranch: 'worktree-my-task',
+          originalCwd: '/work/foreign',
+          originalBranch: 'main',
+          originalHeadCommit: 'abc123',
+        });
+
+      try {
+        const res = await request(app)
+          .post('/session/wt-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND });
+
+        expect(res.status).toBe(500);
+        expect(bridge.changeSessionCwdCalls).toHaveLength(0);
+        expect(bridge.setSessionWorktreeCalls).toHaveLength(0);
+      } finally {
+        mockWt.readSidecar = undefined;
+        mockWt.readMarker = undefined;
         mockWt.realpath = undefined;
       }
     });
@@ -15423,6 +15789,35 @@ describe('createServeApp', () => {
         expect(bridge.setSessionWorktreeCalls).toHaveLength(0);
       } finally {
         mockWt.readSidecar = undefined;
+      }
+    });
+
+    it('fails closed when the strict sidecar reader reports corruption', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      mockWt.readSidecarStrict = () =>
+        Promise.resolve({ state: 'invalid', reason: 'invalid sidecar JSON' });
+
+      try {
+        const res = await request(app)
+          .post('/session/wt-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND });
+
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('Worktree sidecar is missing or invalid');
+        expect(bridge.killCalls).toEqual([
+          {
+            sessionId: 'wt-session',
+            opts: { requireZeroAttaches: true },
+          },
+        ]);
+      } finally {
+        mockWt.readSidecarStrict = undefined;
       }
     });
 
@@ -15560,6 +15955,93 @@ describe('createServeApp', () => {
       }
     });
 
+    it('fails closed when worktree relocation returns another path', async () => {
+      const bridge = fakeBridge({
+        changeSessionCwdImpl: async (sessionId) => ({
+          sessionId,
+          previousCwd: WS_BOUND,
+          newCwd: '/work/other',
+          warnings: [],
+        }),
+      });
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      mockWt.realpath = (p) => p;
+      mockWt.readMarker = () =>
+        Promise.resolve({ state: 'valid', sessionId: 'wt-session' });
+      mockWt.readSidecar = () =>
+        Promise.resolve({
+          slug: 'my-task',
+          worktreePath: `${WS_BOUND}/.qwen/worktrees/my-task`,
+          worktreeBranch: 'worktree-my-task',
+          originalCwd: WS_BOUND,
+          originalBranch: 'main',
+          originalHeadCommit: 'abc123',
+        });
+
+      try {
+        const res = await request(app)
+          .post('/session/wt-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND });
+
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('Worktree relocation was rejected');
+        expect(bridge.setSessionWorktreeCalls).toHaveLength(0);
+        expect(bridge.killCalls).toHaveLength(1);
+      } finally {
+        mockWt.readSidecar = undefined;
+        mockWt.readMarker = undefined;
+        mockWt.realpath = undefined;
+      }
+    });
+
+    it('does not expose the missing worktree path through the restore error', async () => {
+      const worktreePath = `${WS_BOUND}/.qwen/worktrees/missing-task`;
+      const bridge = fakeBridge();
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      mockWt.realpath = (candidate) => {
+        if (candidate === worktreePath) {
+          throw Object.assign(new Error(`ENOENT: ${worktreePath}`), {
+            code: 'ENOENT',
+          });
+        }
+        return candidate;
+      };
+      mockWt.readSidecar = () =>
+        Promise.resolve({
+          slug: 'missing-task',
+          worktreePath,
+          worktreeBranch: 'worktree-missing-task',
+          originalCwd: WS_BOUND,
+          originalBranch: 'main',
+          originalHeadCommit: 'abc123',
+        });
+
+      try {
+        const res = await request(app)
+          .post('/session/missing-session/load')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND });
+
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe(
+          'Worktree checkout is missing or inaccessible',
+        );
+        expect(JSON.stringify(res.body)).not.toContain(worktreePath);
+      } finally {
+        mockWt.readSidecar = undefined;
+        mockWt.realpath = undefined;
+      }
+    });
+
     it('fails closed when sidecar path fails containment check', async () => {
       const bridge = fakeBridge();
       const app = createServeApp(
@@ -15567,6 +16049,7 @@ describe('createServeApp', () => {
         undefined,
         { bridge },
       );
+      mockWt.realpath = (p) => p;
       mockWt.readSidecar = () =>
         Promise.resolve({
           slug: 'escape',
@@ -15595,6 +16078,7 @@ describe('createServeApp', () => {
         ]);
       } finally {
         mockWt.readSidecar = undefined;
+        mockWt.realpath = undefined;
       }
     });
   });
@@ -37562,10 +38046,12 @@ describe('Live conversation runtime lifecycle', () => {
         .set('Host', `127.0.0.1:${baseOpts.port}`)
         .send({ cwd: setup.root.canonicalRoot });
       expect(standaloneRestore.status).toBe(200);
-      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual({
-        sessionId: 'generic-session',
-        path: `${setup.root.canonicalRoot}/conversation-generic-session`,
-      });
+      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual(
+        expect.objectContaining({
+          sessionId: 'generic-session',
+          path: `${setup.root.canonicalRoot}/conversation-generic-session`,
+        }),
+      );
 
       const loadCountBeforeExplicit = setup.liveBridge.loadCalls.length;
       const materializeCountBeforeExplicit =
@@ -37589,20 +38075,24 @@ describe('Live conversation runtime lifecycle', () => {
           .set('Host', `127.0.0.1:${baseOpts.port}`)
           .send({ cwd: setup.root.canonicalRoot });
         expect(restored.status).toBe(200);
-        expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual({
-          sessionId,
-          path: `${setup.root.canonicalRoot}/conversation-${sessionId}`,
-        });
+        expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual(
+          expect.objectContaining({
+            sessionId,
+            path: `${setup.root.canonicalRoot}/conversation-${sessionId}`,
+          }),
+        );
       }
       const worker = await request(setup.app)
         .post('/session/worker-session/load')
         .set('Host', `127.0.0.1:${baseOpts.port}`)
         .send({ cwd: setup.root.canonicalRoot });
       expect(worker.status).toBe(200);
-      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual({
-        sessionId: 'worker-session',
-        path: `${setup.root.canonicalRoot}/conversation-worker-session`,
-      });
+      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual(
+        expect.objectContaining({
+          sessionId: 'worker-session',
+          path: `${setup.root.canonicalRoot}/conversation-worker-session`,
+        }),
+      );
 
       for (const sessionId of ['live-active-child', 'live-active-root']) {
         const active = await request(setup.app)
@@ -37744,10 +38234,12 @@ describe('Live conversation runtime lifecycle', () => {
           historyReplay: 'response',
         }),
       );
-      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual({
-        sessionId,
-        path: `${setup.root.canonicalRoot}/conversation-${sessionId}`,
-      });
+      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual(
+        expect.objectContaining({
+          sessionId,
+          path: `${setup.root.canonicalRoot}/conversation-${sessionId}`,
+        }),
+      );
       expect(
         setup.conversationWorkspace.materializeConversationDirectory,
       ).not.toHaveBeenCalled();
@@ -38048,10 +38540,12 @@ describe('Live conversation runtime lifecycle', () => {
       expect(
         setup.conversationWorkspace.materializeConversationDirectory,
       ).not.toHaveBeenCalledWith(storageSessionId);
-      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual({
-        sessionId: canonicalSessionId,
-        path: `${setup.root.canonicalRoot}/conversation-${canonicalSessionId}`,
-      });
+      expect(setup.liveBridge.changeSessionCwdCalls).toContainEqual(
+        expect.objectContaining({
+          sessionId: canonicalSessionId,
+          path: `${setup.root.canonicalRoot}/conversation-${canonicalSessionId}`,
+        }),
+      );
       // Storage-facing reads still follow the persisted spelling.
       expect(readCreationMetadataIfReadable).toHaveBeenCalledWith(
         storageSessionId,
