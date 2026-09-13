@@ -244,6 +244,11 @@ export type {
   ArtifactToolParams,
 } from './tools/artifact/artifact-tool.js';
 export {
+  deleteArtifactSnapshot,
+  readArtifactSnapshot,
+  retainArtifactSnapshot,
+} from './tools/artifact/artifact-snapshots.js';
+export {
   RecordArtifactTool,
   isRecordableDerivedChild,
 } from './tools/record-artifact.js';
@@ -548,9 +553,9 @@ export * from './lsp/configHash.js';
 export * from './lsp/LspConfigLoader.js';
 export * from './lsp/LspConnectionFactory.js';
 export * from './lsp/LspResponseNormalizer.js';
-export * from './lsp/LspServerManager.js';
+export * from './lsp/lsp-server-manager.js';
 export * from './lsp/NativeLspClient.js';
-export * from './lsp/NativeLspService.js';
+export * from './lsp/native-lsp-service.js';
 export * from './lsp/types.js';
 
 // ============================================================================
@@ -718,6 +723,7 @@ export * from './utils/runtimeStatus.js';
 export * from './utils/schemaValidator.js';
 export * from './utils/sessionIdContext.js';
 export * from './utils/secure-browser-launcher.js';
+export { initParser as initShellAstParser } from './utils/shellAstParser.js';
 export * from './utils/shell-utils.js';
 export * from './utils/subagentGenerator.js';
 export * from './utils/symlink.js';
@@ -792,7 +798,7 @@ export {
   resolveStopHookBlockingCap,
   formatStopHookBlockingCapWarning,
 } from './hooks/stopHookCap.js';
-export { type StopFailureErrorType } from './hooks/types.js';
+export type { StopFailureErrorType } from './hooks/types.js';
 export { buildContextUsage } from './hooks/context-usage.js';
 export {
   USER_PROMPT_SUBMIT_CONTEXT_OPEN_TAG,

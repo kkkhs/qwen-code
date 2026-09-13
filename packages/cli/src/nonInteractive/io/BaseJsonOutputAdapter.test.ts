@@ -907,6 +907,30 @@ describe('BaseJsonOutputAdapter', () => {
       );
     });
 
+    it('does not reuse an abandoned attempt as the final result', () => {
+      adapter.processEvent({
+        type: LlmEventType.Content,
+        value: 'orphaned payload',
+      });
+      const abandoned = adapter.finalizeAssistantMessage();
+      adapter['lastAssistantMessage'] = abandoned;
+
+      adapter.processEvent({
+        type: LlmEventType.Retry,
+      });
+      adapter.emitResult({
+        isError: false,
+        durationMs: 1,
+        apiDurationMs: 1,
+        numTurns: 1,
+      });
+
+      expect(adapter.emittedMessages.at(-1)).toMatchObject({
+        type: 'result',
+        result: '',
+      });
+    });
+
     it('should keep main assistant state on a continuation Retry event', () => {
       adapter.processEvent({
         type: LlmEventType.Content,

@@ -644,6 +644,7 @@ export abstract class BaseJsonOutputAdapter {
       }
       return;
     }
+    this.lastAssistantMessage = null;
     this.startAssistantMessageInternal(this.mainAgentMessageState);
   }
 
@@ -670,7 +671,7 @@ export abstract class BaseJsonOutputAdapter {
     const state = this.mainAgentMessageState;
     if (event.type === LlmEventType.Retry) {
       if (!event.isContinuation) {
-        this.startAssistantMessageInternal(state);
+        this.restartAttempt(false, []);
       }
       this.emitSystemMessage('retry', {
         is_continuation: event.isContinuation === true,

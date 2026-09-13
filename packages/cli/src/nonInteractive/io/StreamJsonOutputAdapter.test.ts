@@ -272,6 +272,7 @@ describe('StreamJsonOutputAdapter', () => {
           type: LlmEventType.Content,
           value: 'clean response',
         });
+        const finalMessage = adapter.finalizeAssistantMessage();
 
         const messages = stdoutWriteSpy.mock.calls.map((call: unknown[]) =>
           JSON.parse(call[0] as string),
@@ -290,8 +291,39 @@ describe('StreamJsonOutputAdapter', () => {
               message.event?.type === 'message_start',
           ),
         ).toHaveLength(2);
+        expect(
+          messages.filter(
+            (message: { type?: string; event?: { type?: string } }) =>
+              message.type === 'stream_event' &&
+              message.event?.type === 'message_stop',
+          ),
+        ).toHaveLength(2);
 
-        const finalMessage = adapter.finalizeAssistantMessage();
+        const retryIndex = messages.findIndex(
+          (message: { type?: string; subtype?: string }) =>
+            message.type === 'system' && message.subtype === 'retry',
+        );
+        const firstStopIndex = messages.findIndex(
+          (message: { type?: string; event?: { type?: string } }) =>
+            message.type === 'stream_event' &&
+            message.event?.type === 'message_stop',
+        );
+        const secondStartIndex = messages.findIndex(
+          (
+            message: {
+              type?: string;
+              event?: { type?: string; message?: { content?: unknown[] } };
+            },
+            index: number,
+          ) =>
+            index > retryIndex &&
+            message.type === 'stream_event' &&
+            message.event?.type === 'message_start',
+        );
+        expect(firstStopIndex).toBeGreaterThan(-1);
+        expect(firstStopIndex).toBeLessThan(retryIndex);
+        expect(secondStartIndex).toBeGreaterThan(retryIndex);
+
         expect(finalMessage.message.content).toEqual([
           { type: 'text', text: 'clean response' },
         ]);
